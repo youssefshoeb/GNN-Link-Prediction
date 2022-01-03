@@ -7,4 +7,5 @@ Link Prediction In The Context of Dynamic Networks Masters Thesis
 - download.py: Download and extract dataset.
 - preprocess.py: Preprocess the dataset and save statistics.
 - model.py: Heterogenous Graph Isomorphism Network model.
-- main.py: Training loop. 
+- train.py: Training loop. 
+- config.py: Configuration file.
