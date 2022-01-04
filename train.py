@@ -34,7 +34,7 @@ def mape(y_predict, y_true):
 
 def calculate_metrics(y_pred, y_true, epoch, type):
     acc = mape(y_pred, y_true)
-    print(f"MAPE: {acc}")
+    print(f"MAPE-{type}: {acc}")
     mlflow.log_metric(key=f"MAPE-{type}", value=float(acc), step=epoch)
 
 
@@ -54,13 +54,9 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
 
         # Passing the node features and the connection info
         pred = model(batch.x_dict, batch.edge_index_dict)
-        # print('Shape', pred['link'].shape)
-        # pred = model_readout(pred)
-        print(pred.shape)
 
         # Calculating the loss and gradients
         label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
-        print(label.shape)
         loss = loss_fn(torch.squeeze(pred), label)
         loss.backward()
         optimizer.step()
@@ -79,7 +75,7 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
     return running_loss / step
 
 
-def test(epoch, model, test_loader, loss_fn):
+def test(epoch, model, test_loader, loss_fn, mode):
     all_preds = []
     all_labels = []
     running_loss = 0.0
@@ -100,9 +96,7 @@ def test(epoch, model, test_loader, loss_fn):
 
     all_preds = np.concatenate(all_preds).ravel()
     all_labels = np.concatenate(all_labels).ravel()
-    print("Predictions", all_preds[:10])
-    print("Labels", all_labels[:10])
-    calculate_metrics(all_preds, all_labels, epoch, "test")
+    calculate_metrics(all_preds, all_labels, epoch, mode)
     return running_loss / step
 
 
@@ -112,16 +106,6 @@ if __name__ == "__main__":
     print(f"Cuda available: {torch.cuda.is_available()}")
     print(f"Torch geometric version: {torch_geometric.__version__}")
 
-    '''
-    from mlflow.models.signature import ModelSignature
-    from mlflow.types.schema import Schema, TensorSpec
-
-    input_schema = Schema([TensorSpec(np.dtype(np.float32), (-1, -1), name="x"),
-                       TensorSpec(np.dtype(np.int32), (2, -1), name="edge_index")])
-
-    output_schema = Schema([TensorSpec(np.dtype(np.float32), (-1, 1))])
-    SIGNATURE = ModelSignature(inputs=input_schema, outputs=output_schema)
-    '''
     # Specify tracking server
     mlflow.set_experiment(experiment_name="GNNs")
 
@@ -140,12 +124,10 @@ if __name__ == "__main__":
     # Loading the model
     print("Loading model...")
     # Define a homogeneous GNN model
-    # print('data', data['link']['x'].shape[1])
     input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1]}
     model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
                      act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
     # Convert a homogeneous GNN model into its heterogeneous equivalent
-    # model = to_hetero(model, data.metadata(), aggr='sum')
     model = model.to(DEVICE)
 
     # Initialize parameters.
@@ -175,23 +157,38 @@ if __name__ == "__main__":
         mlflow.log_param("weight_decay", WEIGHT_DECAY)
         mlflow.log_param("epochs", EPOCHS)
 
+        best_loss = np.inf
+
         # Start training
         for epoch in range(EPOCHS):
             # Training
             model.train()
             loss = train_one_epoch(epoch, model, train_loader, optimizer, loss_fn)
-            print(f"Epoch {epoch} | Train Loss {loss}")
+            print(f"Epoch {epoch+1} | Train Loss {loss}")
             mlflow.log_metric(key="Train loss", value=float(loss), step=epoch)
 
-            # Evaluation
+            # Evaluation on validation set
             model.eval()
-            loss = test(epoch, model, val_loader, loss_fn)
-            print(f"Epoch {epoch} | Test Loss {loss}")
-            mlflow.log_metric(key="Test loss", value=float(loss), step=epoch)
+            loss = test(epoch, model, val_loader, loss_fn, "validation")
+            print(f"Epoch {epoch+1} | Validation Loss {loss}")
+            mlflow.log_metric(key="Validation loss", value=float(loss), step=epoch)
+
+            # Update best loss
+            if loss < best_loss:
+                best_loss = loss
+                #  Save the current best model
+                print("Saving new best model ...")
+                mlflow.pytorch.log_model(model, "best_model")
 
             break  # TODO
 
             # scheduler.step()
 
-        # Save the currently best model
-        # mlflow.pytorch.log_model(model, "model", signature=SIGNATURE)
+        # Save the final model
+        mlflow.pytorch.log_model(model, "last_model")
+
+        # Test best model
+        model_uri = "runs:/{}/best_model".format(mlflow.active_run().info.run_id)
+        best_model = mlflow.pytorch.load_model(model_uri)
+        loss = test(0, best_model, test_loader, loss_fn, "test")
+        print(f"Test Loss {loss}")
