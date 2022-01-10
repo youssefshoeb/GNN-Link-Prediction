@@ -4,7 +4,7 @@ import numpy as np
 import mlflow
 
 from dataset import GNNC21Dataset
-from model import HetroGIN
+from model import Hetro_FAST_ID_GIN
 from torch_geometric.loader import DataLoader
 from config import *
 
@@ -125,8 +125,10 @@ if __name__ == "__main__":
     print("Loading model...")
     # Define a homogeneous GNN model
     input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1]}
-    model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
-                     act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
+    # model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
+    #                 act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
+    model = Hetro_FAST_ID_GIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
+                              act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
     # Convert a homogeneous GNN model into its heterogeneous equivalent
     model = model.to(DEVICE)
 
