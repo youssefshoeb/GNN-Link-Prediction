@@ -328,6 +328,6 @@ class Hetro_FAST_ID_GIN(torch.nn.Module):
 
         for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
             link = edge_index_dict[('path', 'uses', 'link')][1][index]
-            delays.index_add_(0, path, x[link][0])
+            delays.index_add_(0, path.cpu(), x[link][0].cpu())
 
         return delays
