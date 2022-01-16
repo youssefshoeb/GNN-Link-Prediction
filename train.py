@@ -67,8 +67,6 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
         all_preds.append(pred.cpu().detach().numpy())
         all_labels.append(label.cpu().detach().numpy())
 
-        break  # TODO
-
     all_preds = np.concatenate(all_preds).ravel()
     all_labels = np.concatenate(all_labels).ravel()
     calculate_metrics(all_preds, all_labels, epoch, "train")
@@ -83,7 +81,6 @@ def test(epoch, model, test_loader, loss_fn, mode):
     for batch in test_loader:
         batch.to(DEVICE)
         pred = model(batch.x_dict, batch.edge_index_dict)
-        # pred = model_readout(pred['path'])
         label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
         loss = loss_fn(torch.squeeze(pred), label)
 
@@ -92,7 +89,6 @@ def test(epoch, model, test_loader, loss_fn, mode):
         step += 1
         all_preds.append(pred.cpu().detach().numpy())
         all_labels.append(label.cpu().detach().numpy())
-        break  # TODO
 
     all_preds = np.concatenate(all_preds).ravel()
     all_labels = np.concatenate(all_labels).ravel()
@@ -182,12 +178,10 @@ if __name__ == "__main__":
                 print("Saving new best model ...")
                 mlflow.pytorch.log_model(model, "best_model")
 
-            break  # TODO
-
             # scheduler.step()
 
         # Save the final model
-        mlflow.pytorch.log_model(model, "last_model")
+        mlflow.pytorch.log_model(model, f"{EPOCHS}_model")
 
         # Test best model
         model_uri = "runs:/{}/best_model".format(mlflow.active_run().info.run_id)
