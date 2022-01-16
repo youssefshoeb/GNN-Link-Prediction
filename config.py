@@ -6,7 +6,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 LEARNING_RATE = 0.01
 DECAY_RATE = 0  # 0.5
 BATCH_SIZE = 16
-VAL_BATCH_SIZE = 4
+VAL_BATCH_SIZE = 2
 EPOCHS = 10
 # GNN BaseModel
 EMBEDDING_SIZE = 16
