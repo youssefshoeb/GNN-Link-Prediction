@@ -3,9 +3,16 @@ import math
 import numpy as np
 import csv
 
-directories = {"train": './data/raw/gnnet-ch21-dataset-train',
-               "val": './data/raw/gnnet-ch21-dataset-validation',
-               "test": './data/raw/gnnet-ch21-dataset-test-with-labels'}
+'''
+directories = {"train": './data/GNNCH21/raw/gnnet-ch21-dataset-train',
+               "val": './data/GNNCH21/raw/gnnet-ch21-dataset-validation',
+               "test": './data/GNNCH21/raw/gnnet-ch21-dataset-test-with-labels'}
+dataset_name = 'GNNCH21'
+'''
+directories = {"train": './data/GNNCH20/raw/gnnet_data_set_training',
+               "val": './data/GNNCH20/raw/gnnet_data_set_validation',
+               "test": './data/GNNCH20/raw/gnnet_data_set_evaluation_delays'}
+dataset_name = 'GNNCH20'
 
 
 class Welford(object):
@@ -103,39 +110,35 @@ class stats():
             for k, v in self.mean_dict.items():
                 writer.writerow([k, self.max_dict[k], self.min_dict[k], v.mean, v.std, v.standard_error])
 
-    def process_dataset(self, filename):
-        for features, _ in generator(filename):
-            self.process(features)
 
-
-def process_dataset(filename, stats):
-    for features, _ in generator(filename):
+def process_dataset(filename, stats, dataset):
+    for features, _ in generator(filename, dataset):
         for stat in stats:
             stat.process(features)
 
 
 if __name__ == '__main__':
     # initialize stats
-    for features, _ in generator(directories['train']):
+    for features, _ in generator(directories['train'], dataset=dataset_name):
         all_stats = stats(features)
         val_stats = stats(features)
         test_stats = stats(features)
         break
 
     # Process training set stats
-    process_dataset(directories['train'], [all_stats])
+    process_dataset(directories['train'], [all_stats], dataset=dataset_name)
 
     # Save training_set stats
     all_stats.save('training_set_stats.csv')
 
     # Process validation_set stats
-    process_dataset(directories['val'], [all_stats, val_stats])
+    process_dataset(directories['val'], [all_stats, val_stats], dataset=dataset_name)
 
     # Save validation_set stats
     val_stats.save('validation_set_stats.csv')
 
     # Process test_set stats
-    process_dataset(directories['test'], [all_stats, test_stats])
+    process_dataset(directories['test'], [all_stats, test_stats], dataset=dataset_name)
 
     # Save validation_set stats
     test_stats.save('test_set_stats.csv')
