@@ -1,3 +1,4 @@
+from msilib.schema import Error
 import datanetAPI
 import os
 import torch
@@ -7,12 +8,19 @@ import numpy as np
 import networkx as nx
 
 
-def generator(data_dir, intensity_values=[], topology_sizes=[], shuffle=False):
+def generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle=False):
     """
     This function uses the DatanetAPI to output a single sample of the data.
     """
-    tool = datanetAPI.DatanetAPI(
-        data_dir, intensity_values, topology_sizes, shuffle=shuffle)
+    if dataset == "GNNCH21":
+        tool = datanetAPI.Datanet21API(
+            data_dir, intensity_values, topology_sizes, shuffle=shuffle)
+    elif dataset == "GNNCH20":
+        tool = datanetAPI.Datanet20API(
+            data_dir, intensity_values, shuffle=shuffle)
+    else:
+        raise Error("Only 'GNNCH21' and 'GNNCH20' are currently supported")
+
     it = iter(tool)
     num_samples = 0
 
@@ -21,17 +29,15 @@ def generator(data_dir, intensity_values=[], topology_sizes=[], shuffle=False):
         T = sample.get_traffic_matrix()
         R = sample.get_routing_matrix()
         D = sample.get_performance_matrix()
-        P = sample.get_port_stats()
         HG = input_to_networkx(network_graph=G_copy,
                                routing_matrix=R,
                                traffic_matrix=T,
-                               performance_matrix=D,
-                               port_stats=P)
+                               performance_matrix=D)
         num_samples += 1
-        yield HG  # networkx_to_data(HG)
+        yield networkx_to_data(HG)
 
 
-def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance_matrix, port_stats):
+def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance_matrix):
     """
     This function converts a dataset sample to a networkx line graph
     """
@@ -39,7 +45,6 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
     R = routing_matrix
     T = traffic_matrix
     D = performance_matrix
-    P = port_stats
 
     # Create a directed Networkx object
     D_G = nx.DiGraph()
@@ -59,6 +64,10 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
                                      for k, v in G.nodes[src].items())
                     link_feats = dict((f'l_{k}', v)
                                       for k, v in G.edges[src, dst].items())
+
+                    if 'n_schedulingWeights' not in src_feats:
+                        src_feats.update({'n_schedulingWeights': '100,100,100'})
+
                     link_feats.update(src_feats)
                     # For visualization
                     link_feats.update({'Type': 'link'})
@@ -206,10 +215,10 @@ def networkx_to_data(G):
 
 
 class TorchDataset(torch.utils.data.IterableDataset):
-    def __init__(self, filename, intensity=[], topology_sizes=[], shuffle=False):
+    def __init__(self, filename, dataset_name, intensity=[], topology_sizes=[], shuffle=False):
         'Initialization'
         self.generator_object = generator(
-            filename, intensity, topology_sizes, shuffle=shuffle)
+            filename, intensity, topology_sizes, shuffle=shuffle, dataset=dataset_name)
 
     def __iter__(self):
         'Generates one sample of data'
@@ -225,6 +234,7 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         self.test = test
         self.val = val
         self.filename = filename
+        self.dataset_name = "GNNCH21"
 
         super(GNNC21Dataset, self).__init__(root, transform, pre_transform)
 
@@ -260,12 +270,12 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
             x["links"]['l_link_load2']) / (3.8832145562518123 - 0.0)
         x["links"]['l_link_load3'] = (
             x["links"]['l_link_load3']) / (7.652213533388749 - 0.0)
-        x["paths"]['p_PktsGen'] = (
-            x["paths"]['p_PktsGen'] - 0.7498462848223999) / (1.3038396633263194 - 0.7498462848223999)
-        x["paths"]['p_AvgBw'] = (
-            x["paths"]['p_AvgBw'] - 622.2114877920252) / (1346.7849033971643 - 622.2114877920252)
+        x["paths"]['p_PktsGen*'] = (
+            x["paths"]['p_PktsGen*'] - 0.7498462848223999) / (1.3038396633263194 - 0.7498462848223999)
+        x["paths"]['p_AvgBw*'] = (
+            x["paths"]['p_AvgBw*'] - 622.2114877920252) / (1346.7849033971643 - 622.2114877920252)
         x["paths"]['p_time_EqLambda'] = (
-            x["paths"]['p_time_EqLambda'] - 999.9885313720984) / (1000.0249134258452 - 999.9885313720984)
+            x["paths"]['p_time_EqLambda'] - 40.0337) / (1999.52 - 40.0337)
         x["paths"]['p_AvgDelay'] = (
             x["paths"]['p_AvgDelay'] - 0.000418) / (9.15503 - 0.000418)
 
@@ -275,12 +285,10 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         raise NotImplementedError("Download function not implemented")
 
     def process(self):
-        dataset = TorchDataset(os.path.join(self.raw_dir, self.filename))
+        dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
         index = 0
 
-        for sample in dataset:
-            feature_dict, edge_dict = networkx_to_data(sample)
-
+        for feature_dict, edge_dict in dataset:
             feature_dict = self.transformation(feature_dict)
 
             # Create data object
@@ -347,7 +355,7 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         for i in range(n_paths):
             path_features[i][0] = features['paths']['p_AvgBw*'][i]
             path_features[i][1] = features['paths']['p_PktsGen*'][i]
-            path_features[i][2] = features['paths']['p_time_EqLambda*'][i]
+            path_features[i][2] = features['paths']['p_time_EqLambda'][i]
 
         return path_features
 
@@ -377,6 +385,199 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         return data
 
 
+class GNNC20Dataset(torch_geometric.data.Dataset):
+    def __init__(self, root, filename, val=False, test=False, transform=None, pre_transform=None):
+        """
+        root = Where the dataset should be stored. This folder is split
+        into raw_dir (downloaded dataset) and processed_dir (processed data).
+        """
+        self.test = test
+        self.val = val
+        self.filename = filename
+        self.dataset_name = "GNNCH20"
+
+        super(GNNC21Dataset, self).__init__(root, transform, pre_transform)
+
+    @property
+    def raw_file_names(self):
+        """ If this file exists in raw_dir, the download is not triggered.
+            (The download func. is not implemented here)
+        """
+        # Add the name of the dataset gnnet_data_set_training
+        return ['dummy.csv']
+
+    @property
+    def processed_file_names(self):
+        """ If these files are found in raw_dir, processing is skipped"""
+
+        if self.test:
+            return [f'data_test_{i}.pt' for i in range(20)]
+        elif self.val:
+            return [f'data_val_{i}.pt' for i in range(20)]
+        else:
+            return [f'data_{i}.pt' for i in range(20)]
+
+    def transformation(self, x):
+        """Apply a transformation over all the samples included in the dataset.
+            Args:
+                x (dict): predictor variable.
+            Returns:
+                x,y: The modified predictor/target variables.
+            """
+        x["links"]['l_link_load'] = (
+            x["links"]['l_link_load'] - 0.0) / (4.203 - 0.001)
+        x["links"]['l_link_load2'] = (
+            x["links"]['l_link_load2']) / (17.663 - 0.0)
+        x["links"]['l_link_load3'] = (
+            x["links"]['l_link_load3']) / (74.234 - 0.0)
+        x["paths"]['p_PktsGen*'] = (
+            x["paths"]['p_PktsGen*'] - 0.899) / (1.102 - 0.899)
+        x["paths"]['p_AvgBw*'] = (
+            x["paths"]['p_AvgBw*'] - 881.034) / (1134.054 - 881.034)
+        x["paths"]['p_time_EqLambda'] = (
+            x["paths"]['p_time_EqLambda'] - 40.0237) / (1999.63 - 40.0237)
+        x["paths"]['p_AvgDelay'] = (
+            x["paths"]['p_AvgDelay'] - 0.0075) / (246006.0 - 0.0075)
+
+        schedulingweights = x["links"]['n_schedulingWeights'].split(',')
+        x["links"]['n_schedulingWeights'] = f'{schedulingweights[0]/100},{schedulingweights[1]/100},{schedulingweights[2]/100}'
+
+        return x
+
+    def download(self):
+        raise NotImplementedError("Download function not implemented")
+
+    def process(self):
+        dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
+        index = 0
+
+        for feature_dict, edge_dict in dataset:
+            feature_dict = self.transformation(feature_dict)
+
+            # Create data object
+            data = torch_geometric.data.HeteroData()
+
+            # Get node features and labels
+            data['link'].x = self._get_link_features(
+                feature_dict)  # [num_link, num_features_link]
+            data['path'].x = self._get_path_features(
+                feature_dict)  # [num_path, num_features_path]
+
+            # Get adjacency info
+            data['path', 'uses', 'link'].edge_index = edge_dict['p-l']
+            data['link', 'includes', 'path'].edge_index = edge_dict['l-p']
+            data['link', 'connects', 'link'].edge_index = edge_dict['l-l']
+
+            # Label
+            data['path'].y = self._get_label(feature_dict)
+
+            if self.test:
+                torch.save(data, os.path.join(
+                    self.processed_dir, f'data_test_{index}.pt'))
+            elif self.val:
+                torch.save(data, os.path.join(
+                    self.processed_dir, f'data_val_{index}.pt'))
+            else:
+                torch.save(data, os.path.join(
+                    self.processed_dir, f'data_{index}.pt'))
+            index += 1
+
+    def _get_link_features(self, features):
+        """
+        This will return a matrix / 2d array of the shape
+        [Number of links, link Feature size]
+        """
+        """
+        Features ignored: 'l_bandwidth'
+        """
+        n_links = len(features["links"][next(iter(features["links"]))])
+        num_link_features = 3
+        link_features = torch.zeros((n_links, num_link_features))
+
+        for i in range(n_links):
+            link_features[i][0] = features["links"]['l_link_load'][i]
+            link_features[i][1] = features["links"]['l_link_load2'][i]
+            link_features[i][2] = features["links"]['l_link_load3'][i]
+            policy = features["links"]['n_schedulingPolicy'][i]
+            if policy == "WFQ":
+                link_features[i][3] = 1
+                link_features[i][4] = 0
+                link_features[i][5] = 0
+            elif policy == "SP":
+                link_features[i][3] = 0
+                link_features[i][4] = 1
+                link_features[i][5] = 0
+            elif policy == "DRR":
+                link_features[i][3] = 0
+                link_features[i][4] = 0
+                link_features[i][5] = 1
+            weights = features["links"]['n_schedulingWeights'][i].split(',')
+            link_features[i][6] = weights[0]
+            link_features[i][7] = weights[1]
+            link_features[i][8] = weights[2]
+
+        return link_features
+
+    def _get_path_features(self, features):
+        """
+        This will return a matrix / 2d array of the shape
+        [Number of paths, Path feature size]
+        """
+        """
+        Features ignored: 'p_ToS', 'p_time_ExpMaxFactor', 'p_TimeDist', 'p_SizeDist',
+        'p_size_AvgPktSize', 'p_size_PktSize1', 'p_size_PktSize2', 'p_TotalPktsGen',
+        'p_time_AvgPktsLambda
+        """
+        n_paths = len(features["paths"][next(iter(features["paths"]))])
+        num_path_features = 3
+        path_features = torch.zeros((n_paths, num_path_features))
+
+        for i in range(n_paths):
+            path_features[i][0] = features['paths']['p_AvgBw*'][i]
+            path_features[i][1] = features['paths']['p_PktsGen*'][i]
+            path_features[i][2] = features['paths']['p_time_EqLambda'][i]
+            tos = features['paths']['p_ToS'][i]
+            if tos == 0:
+                path_features[i][3] = 1
+                path_features[i][4] = 0
+                path_features[i][5] = 0
+            elif tos == 1:
+                path_features[i][3] = 0
+                path_features[i][4] = 1
+                path_features[i][5] = 0
+            elif tos == 2:
+                path_features[i][3] = 0
+                path_features[i][4] = 0
+                path_features[i][5] = 1
+
+        return path_features
+
+    def _get_label(self, features):
+        return features["paths"]['p_AvgDelay']
+
+    def len(self):
+        if self.test:
+            return 50_000
+        elif self.val:
+            return 100_000
+        return 400_000
+
+    def get(self, idx):
+        """ - Equivalent to __getitem__ in pytorch
+            - Is not needed for PyG's InMemoryDataset
+        """
+        if self.test:
+            data = torch.load(os.path.join(
+                self.processed_dir, f'data_test_{idx}.pt'))
+        elif self.val:
+            data = torch.load(os.path.join(
+                self.processed_dir, f'data_val_{idx}.pt'))
+        else:
+            data = torch.load(os.path.join(
+                self.processed_dir, f'data_{idx}.pt'))
+        return data
+
+
 """
 for G,R,P,D in generator('./data/raw/gnnet-ch21-dataset-train'):
     G = nx.DiGraph(G)
@@ -386,22 +587,29 @@ for G,R,P,D in generator('./data/raw/gnnet-ch21-dataset-train'):
     break
 """
 """
-for features, index in generator('./data/raw/gnnet-ch21-dataset-train'):
+for features, index in generator('./data/GNNCH20/raw/gnnet_data_set_training', dataset="GNNCH20"):
     print(features)
-    #print(networkx_to_data(x))
+    # print(networkx_to_data(x))
     # for node in x.nodes(data=True):
-        #if node[0].split('_')[0]=="l":
-        #print(node)
+        # if node[0].split('_')[0]=="l":
+        # print(node)
     #    pass
 
-    #print(x)
+    # print(x)
     break
 """
 
 if __name__ == '__main__':
     train_dataset = GNNC21Dataset(
-        root='data/', filename='gnnet-ch21-dataset-train')
+        root='data/GNNCH21/', filename='gnnet-ch21-dataset-train')
     val_dataset = GNNC21Dataset(
-        root='data/', filename='gnnet-ch21-dataset-validation', val=True)
+        root='data/GNNCH21/', filename='gnnet-ch21-dataset-validation', val=True)
     test_dataset = GNNC21Dataset(
-        root='data/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
+        root='data/GNNCH21/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
+
+    train_dataset = GNNC20Dataset(
+        root='data/GNNCH20/', filename='gnnet_data_set_training')
+    val_dataset = GNNC20Dataset(
+        root='data/GNNCH20/', filename='gnnet_data_set-validation', val=True)
+    test_dataset = GNNC20Dataset(
+        root='data/GNNCH20/', filename='gnnet_data_set_evaluation_delays', test=True)
