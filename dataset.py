@@ -218,7 +218,7 @@ class TorchDataset(torch.utils.data.IterableDataset):
     def __init__(self, filename, dataset_name, intensity=[], topology_sizes=[], shuffle=False):
         'Initialization'
         self.generator_object = generator(
-            filename, intensity, topology_sizes, shuffle=shuffle, dataset=dataset_name)
+            filename, dataset_name, intensity, topology_sizes, shuffle=shuffle)
 
     def __iter__(self):
         'Generates one sample of data'
@@ -396,7 +396,7 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         self.filename = filename
         self.dataset_name = "GNNCH20"
 
-        super(GNNC21Dataset, self).__init__(root, transform, pre_transform)
+        super(GNNC20Dataset, self).__init__(root, transform, pre_transform)
 
     @property
     def raw_file_names(self):
@@ -439,8 +439,8 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         x["paths"]['p_AvgDelay'] = (
             x["paths"]['p_AvgDelay'] - 0.0075) / (246006.0 - 0.0075)
 
-        schedulingweights = x["links"]['n_schedulingWeights'].split(',')
-        x["links"]['n_schedulingWeights'] = f'{schedulingweights[0]/100},{schedulingweights[1]/100},{schedulingweights[2]/100}'
+        schedulingweights = [y.split(',') for y in x["links"]['n_schedulingWeights']]
+        x["links"]['n_schedulingWeights'] = [f'{float(elem[0])/100},{float(elem[1])/100},{float(elem[2])/100}' for elem in schedulingweights]
 
         return x
 
@@ -491,7 +491,7 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         Features ignored: 'l_bandwidth'
         """
         n_links = len(features["links"][next(iter(features["links"]))])
-        num_link_features = 3
+        num_link_features = 9
         link_features = torch.zeros((n_links, num_link_features))
 
         for i in range(n_links):
@@ -512,9 +512,9 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
                 link_features[i][4] = 0
                 link_features[i][5] = 1
             weights = features["links"]['n_schedulingWeights'][i].split(',')
-            link_features[i][6] = weights[0]
-            link_features[i][7] = weights[1]
-            link_features[i][8] = weights[2]
+            link_features[i][6] = float(weights[0])
+            link_features[i][7] = float(weights[1])
+            link_features[i][8] = float(weights[2])
 
         return link_features
 
@@ -529,7 +529,7 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         'p_time_AvgPktsLambda
         """
         n_paths = len(features["paths"][next(iter(features["paths"]))])
-        num_path_features = 3
+        num_path_features = 6
         path_features = torch.zeros((n_paths, num_path_features))
 
         for i in range(n_paths):
@@ -600,13 +600,14 @@ for features, index in generator('./data/GNNCH20/raw/gnnet_data_set_training', d
 """
 
 if __name__ == '__main__':
+    """
     train_dataset = GNNC21Dataset(
         root='data/GNNCH21/', filename='gnnet-ch21-dataset-train')
     val_dataset = GNNC21Dataset(
         root='data/GNNCH21/', filename='gnnet-ch21-dataset-validation', val=True)
     test_dataset = GNNC21Dataset(
         root='data/GNNCH21/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
-
+    """
     train_dataset = GNNC20Dataset(
         root='data/GNNCH20/', filename='gnnet_data_set_training')
     val_dataset = GNNC20Dataset(
