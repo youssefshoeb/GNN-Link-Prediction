@@ -600,7 +600,6 @@ for features, index in generator('./data/GNNCH20/raw/gnnet_data_set_training', d
 """
 
 if __name__ == '__main__':
-    """
     train_dataset = GNNC21Dataset(
         root='data/GNNCH21/', filename='gnnet-ch21-dataset-train')
     val_dataset = GNNC21Dataset(
@@ -611,6 +610,7 @@ if __name__ == '__main__':
     train_dataset = GNNC20Dataset(
         root='data/GNNCH20/', filename='gnnet_data_set_training')
     val_dataset = GNNC20Dataset(
-        root='data/GNNCH20/', filename='gnnet_data_set-validation', val=True)
+        root='data/GNNCH20/', filename='gnnet_data_set_validation', val=True)
     test_dataset = GNNC20Dataset(
         root='data/GNNCH20/', filename='gnnet_data_set_evaluation_delays', test=True)
+    """
