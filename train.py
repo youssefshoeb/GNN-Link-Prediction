@@ -30,7 +30,9 @@ def mape(y_predict, y_true):
     '''
     Mean Absolute Percentage Error
     '''
-    return np.average(np.abs((y_predict - y_true) / (np.abs(y_true) + 0.0000001))) * 100
+    # double check why one of the labels is zero ?
+    # return np.average(np.abs((y_predict - y_true) / (np.abs(y_true) + 0.0000001))) * 100
+    return torch.mean(torch.abs((y_predict - y_true) / (torch.abs(y_true) + 0.0000001))) * 100
 
 
 def calculate_metrics(y_pred, y_true, epoch, type):
@@ -43,6 +45,7 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
     # Enumerate over the data
     all_preds = []
     all_labels = []
+    mapes = []
     running_loss = 0.0
     step = 0
 
@@ -58,42 +61,61 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
 
         # Calculating the loss and gradients
         label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
-        loss = loss_fn(torch.squeeze(pred), label)
+        loss_value = mape(torch.squeeze(pred), label)
+        # loss = loss_fn(torch.squeeze(pred), label)
+        """
+        Root mean squared error (should we square the error first )?
+        However squaring the error will give more weight to larger errors than smaller ones,
+        skewing the error estimate towards the odd outliers, Do we want this ?
+        Currently I'm keeping the mean absolute error however I am taking the square root of
+        the value does this make sense ? or should I remove the square root ?
+        """
+        loss = torch.sqrt(loss_value)
         loss.backward()
         optimizer.step()
 
         # Update tracking
-        running_loss += loss.item()
+        running_loss += loss_value.item()
         step += 1
-        all_preds.append(pred.cpu().detach().numpy())
-        all_labels.append(label.cpu().detach().numpy())
+        # all_preds.append(pred.cpu().detach().numpy())
+        # all_labels.append(label.cpu().detach().numpy())
+        mapes.append(loss_value.cpu().detach().numpy())
+        # break # TODO
 
-    all_preds = np.concatenate(all_preds).ravel()
-    all_labels = np.concatenate(all_labels).ravel()
-    calculate_metrics(all_preds, all_labels, epoch, "train")
+    # all_preds = np.concatenate(all_preds).ravel()
+    # all_labels = np.concatenate(all_labels).ravel()
+    # calculate_metrics(all_preds, all_labels, epoch, "train")
+    print(f"MAPE-train: {np.average(mapes)}")
+    mlflow.log_metric(key=f"MAPE-train", value=float(np.average(mapes)), step=epoch)
     return running_loss / step
 
 
 def test(epoch, model, test_loader, loss_fn, mode):
     all_preds = []
     all_labels = []
+    mapes = []
     running_loss = 0.0
     step = 0
     for batch in tqdm.tqdm(test_loader):
         batch.to(DEVICE)
         pred = model(batch.x_dict, batch.edge_index_dict)
         label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
-        loss = loss_fn(torch.squeeze(pred), label)
+        # loss = loss_fn(torch.squeeze(pred), label)
+        loss_value = mape(torch.squeeze(pred), label)
 
         # Update tracking
-        running_loss += loss.item()
+        running_loss += loss_value.item()
         step += 1
-        all_preds.append(pred.cpu().detach().numpy())
-        all_labels.append(label.cpu().detach().numpy())
+        mapes.append(loss_value.cpu().detach().numpy())
+        # all_preds.append(pred.cpu().detach().numpy())
+        # all_labels.append(label.cpu().detach().numpy())
+        # break # TODO
 
-    all_preds = np.concatenate(all_preds).ravel()
-    all_labels = np.concatenate(all_labels).ravel()
-    calculate_metrics(all_preds, all_labels, epoch, mode)
+    # all_preds = np.concatenate(all_preds).ravel()
+    # all_labels = np.concatenate(all_labels).ravel()
+    # calculate_metrics(all_preds, all_labels, epoch, mode)
+    print(f"MAPE-{mode}: {np.average(mapes)}")
+    mlflow.log_metric(key=f"MAPE-{mode}", value=float(np.average(mapes)), step=epoch)
     return running_loss / step
 
 
@@ -134,7 +156,7 @@ if __name__ == "__main__":
     num_params = count_parameters(model)
     print(f"Number of parameters: {num_params}")
 
-    with mlflow.start_run(run_name="GIN Run: 1"):
+    with mlflow.start_run(run_name="GIN Run: 3"):
         mlflow.log_param("num_params", num_params)
         mlflow.log_param("embedding_size", EMBEDDING_SIZE)
         mlflow.log_param("num_mp_layers", NUM_LAYERS)
