@@ -134,5 +134,8 @@ data/
 # Archive
 archive/
 
+# MLRuns
+mlruns/
+
 # vscode
 .vscode

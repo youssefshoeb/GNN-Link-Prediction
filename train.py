@@ -2,6 +2,7 @@ import torch
 import torch_geometric
 import numpy as np
 import mlflow
+import tqdm
 
 from dataset import GNNC21Dataset
 from model import Hetro_FAST_ID_GIN
@@ -29,7 +30,7 @@ def mape(y_predict, y_true):
     '''
     Mean Absolute Percentage Error
     '''
-    return np.average(np.abs((y_predict - y_true) / np.abs(y_true))) * 100
+    return np.average(np.abs((y_predict - y_true) / (np.abs(y_true) + 0.0000001))) * 100
 
 
 def calculate_metrics(y_pred, y_true, epoch, type):
@@ -45,7 +46,7 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
     running_loss = 0.0
     step = 0
 
-    for _, batch in enumerate(train_loader):
+    for _, batch in tqdm.tqdm(enumerate(train_loader)):
         # Use GPU if available
         batch.to(DEVICE)
 
@@ -78,7 +79,7 @@ def test(epoch, model, test_loader, loss_fn, mode):
     all_labels = []
     running_loss = 0.0
     step = 0
-    for batch in test_loader:
+    for batch in tqdm.tqdm(test_loader):
         batch.to(DEVICE)
         pred = model(batch.x_dict, batch.edge_index_dict)
         label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
@@ -107,9 +108,9 @@ if __name__ == "__main__":
 
     # Loading the dataset
     print("Loading dataset...")
-    train_dataset = GNNC21Dataset(root='data/', filename='gnnet_data_set_training')
-    val_dataset = GNNC21Dataset(root='data/', filename='gnnet_data_set_validation', val=True)
-    test_dataset = GNNC21Dataset(root='data/', filename='gnnet_data_set_evaluation_delays', test=True)
+    train_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_training')
+    val_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_validation', val=True)
+    test_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_evaluation_delays', test=True)
     data = train_dataset[0]
 
     # Prepare training
