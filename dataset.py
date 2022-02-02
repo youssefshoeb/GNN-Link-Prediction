@@ -39,7 +39,10 @@ def generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle
 
 def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance_matrix):
     """
-    This function converts a dataset sample to a networkx line graph
+    This function converts a dataset sample to a networkx line graph.
+    To be used for GNN-CH21 Dataset.
+    Uncomment lines to return back to more generic mode that allows for
+    saving all featurs (Warning: Extremly Slow)
     """
     G = nx.DiGraph(network_graph)
     R = routing_matrix
@@ -60,17 +63,18 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
                 # Add links to the graph as nodes
                 if G.has_edge(src, dst):
                     # Add source node stats to link features
-                    src_feats = dict((f'n_{k}', v)
-                                     for k, v in G.nodes[src].items())
-                    link_feats = dict((f'l_{k}', v)
-                                      for k, v in G.edges[src, dst].items())
+                    # src_feats = dict((f'n_{k}', v)
+                    #                 for k, v in G.nodes[src].items())
+                    # link_feats = dict((f'n_{k}', v)
+                    #                 for k, v in G.edges[src, dst].items())
+                    link_feats = {'l_bandwidth': G.edges[src, dst]['bandwidth']}
 
-                    if 'n_schedulingWeights' not in src_feats:
-                        src_feats.update({'n_schedulingWeights': '100,100,100'})
+                    # if 'n_schedulingWeights' not in src_feats:
+                    #    src_feats.update({'n_schedulingWeights': '100,100,100'})
 
-                    link_feats.update(src_feats)
+                    # link_feats.update(src_feats)
                     # For visualization
-                    link_feats.update({'Type': 'link'})
+                    # link_feats.update({'Type': 'link'})
 
                     D_G.add_node('l_{}_{}'.format(src, dst), **link_feats)
 
@@ -89,9 +93,9 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
                         # For visualizeation remove enums
                         dct_flows.pop('p_TimeDist')
                         dct_flows.pop('p_SizeDist')
-                        dct_flows.update({'TimeDist': T[src, dst]['Flows'][f_id]['TimeDist'].name})
-                        dct_flows.update({'SizeDist': T[src, dst]['Flows'][f_id]['SizeDist'].name})
-                        dct_flows.update({'Type': 'path'})
+                        dct_flows.update({'p_TimeDist': T[src, dst]['Flows'][f_id]['TimeDist'].name})
+                        dct_flows.update({'p_SizeDist': T[src, dst]['Flows'][f_id]['SizeDist'].name})
+                        # dct_flows.update({'Type': 'path'})
                         # Flatten dict of dicts to just a dict
                         dct_flows.pop('p_SizeDistParams')
                         dct_flows.pop('p_TimeDistParams')
@@ -104,13 +108,26 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
                         dct_flows['p_AvgDelay'] = D[src,
                                                     dst]['Flows'][f_id]['AvgDelay']
 
+                        # remove some features we already know have no effect
+                        dct_flows.pop('p_ToS')
+                        dct_flows.pop('p_time_ExpMaxFactor')
+                        dct_flows.pop('p_TimeDist')
+                        dct_flows.pop('p_SizeDist')
+                        dct_flows.pop('p_size_AvgPktSize')
+                        dct_flows.pop('p_size_PktSize1')
+                        dct_flows.pop('p_size_PktSize2')
+                        dct_flows.pop('p_TotalPktsGen')
+
                         # divide features by p_time_AvgPktsLambda
                         dct_flows['p_PktsGen*'] = dct_flows['p_PktsGen'] / \
                             dct_flows['p_time_AvgPktsLambda']
                         dct_flows['p_AvgBw*'] = dct_flows['p_AvgBw'] / \
                             dct_flows['p_time_AvgPktsLambda']
-                        dct_flows['p_time_EqLambda*'] = dct_flows['p_time_EqLambda'] / \
-                            dct_flows['p_time_AvgPktsLambda']
+                        # dct_flows['p_time_EqLambda*'] = dct_flows['p_time_EqLambda'] / \
+                        #    dct_flows['p_time_AvgPktsLambda']
+
+                        dct_flows.pop('p_time_AvgPktsLambda')
+                        dct_flows.pop('p_PktsGen')
 
                         D_G.add_node('p_{}_{}_{}'.format(
                             src, dst, f_id), **dct_flows)
@@ -146,6 +163,7 @@ def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance
                     load += D_G.nodes(data=True)[src]["p_AvgBw"]
 
             load /= D_G.nodes(data=True)[node]["l_bandwidth"]
+            del D_G.nodes(data=True)[node]["l_bandwidth"]
 
             link_loads[node] = {
                 "l_link_load": load, "l_link_load2": load * load, "l_link_load3": load * load * load}
@@ -587,7 +605,7 @@ for G,R,P,D in generator('./data/raw/gnnet-ch21-dataset-train'):
     break
 """
 """
-for features, index in generator('./data/GNNCH20/raw/gnnet_data_set_training', dataset="GNNCH20"):
+for features, index in generator('./data/GNN-CH21/raw/gnnet-ch21-dataset-train', dataset="GNNCH21"):
     print(features)
     # print(networkx_to_data(x))
     # for node in x.nodes(data=True):
