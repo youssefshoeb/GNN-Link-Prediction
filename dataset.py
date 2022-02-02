@@ -1,4 +1,3 @@
-from msilib.schema import Error
 import datanetAPI
 import os
 import torch
@@ -18,8 +17,6 @@ def generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle
     elif dataset == "GNNCH20":
         tool = datanetAPI.Datanet20API(
             data_dir, intensity_values, shuffle=shuffle)
-    else:
-        raise Error("Only 'GNNCH21' and 'GNNCH20' are currently supported")
 
     it = iter(tool)
     num_samples = 0
