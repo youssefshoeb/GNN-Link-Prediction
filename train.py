@@ -4,8 +4,8 @@ import numpy as np
 import mlflow
 import tqdm
 
-from dataset import GNNC21Dataset
-from model import Hetro_FAST_ID_GIN
+from dataset import HETROGNNC21Dataset
+from model import HetroGIN
 from torch_geometric.loader import DataLoader
 from config import *
 
@@ -60,9 +60,8 @@ def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
         pred = model(batch.x_dict, batch.edge_index_dict)
 
         # Calculating the loss and gradients
-        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
-        loss_value = mape(torch.squeeze(pred), label)
-        # loss = loss_fn(torch.squeeze(pred), label)
+        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float).to(DEVICE)
+        loss_value = loss_fn(torch.squeeze(pred), label)
         """
         Root mean squared error (should we square the error first )?
         However squaring the error will give more weight to larger errors than smaller ones,
@@ -99,14 +98,13 @@ def test(epoch, model, test_loader, loss_fn, mode):
     for batch in tqdm.tqdm(test_loader):
         batch.to(DEVICE)
         pred = model(batch.x_dict, batch.edge_index_dict)
-        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float)
-        # loss = loss_fn(torch.squeeze(pred), label)
-        loss_value = mape(torch.squeeze(pred), label)
+        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float).to(DEVICE)
+        loss = loss_fn(torch.squeeze(pred), label)
 
         # Update tracking
-        running_loss += loss_value.item()
+        running_loss += loss.item()
         step += 1
-        mapes.append(loss_value.cpu().detach().numpy())
+        mapes.append(loss.cpu().detach().numpy())
         # all_preds.append(pred.cpu().detach().numpy())
         # all_labels.append(label.cpu().detach().numpy())
         # break # TODO
@@ -130,9 +128,9 @@ if __name__ == "__main__":
 
     # Loading the dataset
     print("Loading dataset...")
-    train_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_training')
-    val_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_validation', val=True)
-    test_dataset = GNNC21Dataset(root='data/GNN-CH21/', filename='gnnet_data_set_evaluation_delays', test=True)
+    train_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-train')
+    val_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-validation', val=True)
+    test_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
     data = train_dataset[0]
 
     # Prepare training
@@ -143,11 +141,12 @@ if __name__ == "__main__":
     # Loading the model
     print("Loading model...")
     # Define a homogeneous GNN model
-    input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1]}
-    # model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
+    input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1], 'node': data['node']['x'].shape[1]}
+    # input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1]}
+    # model = HetroLineGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
     #                 act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
-    model = Hetro_FAST_ID_GIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
-                              act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
+    model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
+                     act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
     # Convert a homogeneous GNN model into its heterogeneous equivalent
     model = model.to(DEVICE)
 
@@ -156,7 +155,7 @@ if __name__ == "__main__":
     num_params = count_parameters(model)
     print(f"Number of parameters: {num_params}")
 
-    with mlflow.start_run(run_name="GIN Run: 3"):
+    with mlflow.start_run(run_name="GIN Run: 4"):
         mlflow.log_param("num_params", num_params)
         mlflow.log_param("embedding_size", EMBEDDING_SIZE)
         mlflow.log_param("num_mp_layers", NUM_LAYERS)
@@ -168,7 +167,7 @@ if __name__ == "__main__":
         mlflow.log_param("jk", JK_MODE)
 
         # Training paramerers
-        loss_fn = torch.nn.MSELoss()
+        loss_fn = mape  # torch.nn.MSELoss()
         # optimizer = torch.optim.Adam(list(model.parameters()) + list(model_readout.parameters()), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=DECAY_RATE)
         optimizer = torch.optim.Adam(list(model.parameters()), lr=LEARNING_RATE)
@@ -199,7 +198,9 @@ if __name__ == "__main__":
                 best_loss = loss
                 #  Save the current best model
                 print("Saving new best model ...")
+                model = model.to("cpu")
                 mlflow.pytorch.log_model(model, "best_model")
+                model = model.to(DEVICE)
 
             # scheduler.step()
 
@@ -209,5 +210,6 @@ if __name__ == "__main__":
         # Test best model
         model_uri = "runs:/{}/best_model".format(mlflow.active_run().info.run_id)
         best_model = mlflow.pytorch.load_model(model_uri)
+        best_model = best_model.to(DEVICE)
         loss = test(0, best_model, test_loader, loss_fn, "test")
         print(f"Test Loss {loss}")
