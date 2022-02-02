@@ -110,7 +110,7 @@ class GINLayer(torch.nn.Module):
         return x
 
 
-class HetroGIN(torch.nn.Module):
+class HetroLineGIN(torch.nn.Module):
     def __init__(self, input_channels: dict, embedding_size: int, num_layers: int = 2,
                  dropout: float = 0.0,
                  act: Optional[Callable] = torch.nn.ReLU(inplace=True),
@@ -208,7 +208,7 @@ class HetroGIN(torch.nn.Module):
         return delays
 
 
-class FAST_ID_GINLayer(torch.nn.Module):
+class FastIDLineGINLayer(torch.nn.Module):
     """A single GIN layer consits of the GINConv layer followed by batch normalization
     and prelu activation.
     """
@@ -235,7 +235,7 @@ class FAST_ID_GINLayer(torch.nn.Module):
         return x
 
 
-class Hetro_FAST_ID_GIN(torch.nn.Module):
+class HetroFastIDLineGIN(torch.nn.Module):
     def __init__(self, input_channels: dict, embedding_size: int, num_layers: int = 2,
                  dropout: float = 0.0,
                  act: Optional[Callable] = torch.nn.ReLU(inplace=True),
@@ -255,14 +255,14 @@ class Hetro_FAST_ID_GIN(torch.nn.Module):
         self.convs.append(HeteroConv({
             ('path', 'uses', 'link'): GINLayer(input_channels['path'] + input_channels['link'], embedding_size, concat=True),
             ('link', 'includes', 'path'): GINLayer(input_channels['link'] + input_channels['path'], embedding_size, concat=True),
-            ('link', 'connects', 'link'): FAST_ID_GINLayer(input_channels['link'], embedding_size, layer_num=0, concat=False)}, aggr='sum'))
+            ('link', 'connects', 'link'): FastIDLineGINLayer(input_channels['link'], embedding_size, layer_num=0, concat=False)}, aggr='sum'))
 
         # remaining conv layers
         for i in range(num_layers - 1):
             self.convs.append(HeteroConv({
                 ('path', 'uses', 'link'): GINLayer(embedding_size, embedding_size),
                 ('link', 'includes', 'path'): GINLayer(embedding_size, embedding_size),
-                ('link', 'connects', 'link'): FAST_ID_GINLayer(embedding_size, embedding_size, layer_num=i + 1)}, aggr='sum'))
+                ('link', 'connects', 'link'): FastIDLineGINLayer(embedding_size, embedding_size, layer_num=i + 1)}, aggr='sum'))
 
         # batch normalization
         if norm is not None:
@@ -290,7 +290,7 @@ class Hetro_FAST_ID_GIN(torch.nn.Module):
                                     torch.nn.BatchNorm1d(post_hidden_layer_size),
                                     torch.nn.PReLU()))
 
-        self.post_layers.append(torch.nn.Linear(post_hidden_layer_size, 1))
+        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), torch.nn.ReLU()))
 
     def forward(self, x_dict, edge_index_dict):
         # TODO Double check this
@@ -318,16 +318,118 @@ class Hetro_FAST_ID_GIN(torch.nn.Module):
             x_dict[k] = self.lin(x_dict[k]) if hasattr(self, 'lin') else x_dict[k]
 
         # post_processing
-        x = x_dict['link']
+        # x = x_dict['link']
+        x = x_dict['path']
         for i in range(self.post_num_layers):
             x = self.post_layers[i](x)
 
         # Get path delays
         # TODO: check if gradients are propagated correctly in this way (maybe find a differnt way using scatter ?)
-        delays = torch.zeros(x_dict['path'].shape[0], dtype=torch.float)
+        # delays = torch.zeros(x_dict['path'].shape[0], dtype=torch.float)
 
-        for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
-            link = edge_index_dict[('path', 'uses', 'link')][1][index]
-            delays.index_add_(0, path.cpu(), x[link][0].cpu())
+        # for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
+        #    link = edge_index_dict[('path', 'uses', 'link')][1][index]
+        #    delays.index_add_(0, path.cpu(), x[link][0].cpu())
 
-        return delays
+        # return delays
+        return x
+
+
+class HetroGIN(torch.nn.Module):
+    def __init__(self, input_channels: dict, embedding_size: int, num_layers: int = 2,
+                 dropout: float = 0.0,
+                 act: Optional[Callable] = torch.nn.ReLU(inplace=True),
+                 norm: Optional[torch.nn.Module] = None, jk: str = 'last',
+                 post_hidden_layer_size: int = 16, post_num_layers: int = 2):
+        super().__init__()
+        self.embedding_size = embedding_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.act = act
+        self.norm = norm
+        self.jk_mode = jk
+
+        self.convs = torch.nn.ModuleList()
+
+        # first conv layer
+        self.convs.append(HeteroConv({
+            ('path', 'uses', 'link'): GINLayer(input_channels['path'] + input_channels['link'], embedding_size, concat=True),
+            ('link', 'includes', 'path'): GINLayer(input_channels['link'] + input_channels['path'], embedding_size, concat=True),
+            ('link', 'connects', 'node'): GINLayer(input_channels['link'] + input_channels['node'], embedding_size, concat=True),
+            ('node', 'has', 'link'): GINLayer(input_channels['node'] + input_channels['link'], embedding_size, concat=True)}, aggr='sum'))
+
+        # remaining conv layers
+        for i in range(num_layers - 1):
+            self.convs.append(HeteroConv({
+                ('path', 'uses', 'link'): GINLayer(embedding_size, embedding_size),
+                ('link', 'includes', 'path'): GINLayer(embedding_size, embedding_size),
+                ('link', 'connects', 'node'): GINLayer(embedding_size, embedding_size),
+                ('node', 'has', 'link'): GINLayer(embedding_size, embedding_size)}, aggr='sum'))
+
+        # batch normalization
+        if norm is not None:
+            self.norms = torch.nn.ModuleList()
+            for _ in range(num_layers):
+                self.norms.append(copy.deepcopy(norm))
+
+        # jumping knowledge
+        if self.jk_mode != 'last':
+            self.jk = JumpingKnowledge(jk, embedding_size, num_layers)
+        if self.jk_mode == 'cat':
+            self.lin = Linear(num_layers * embedding_size, embedding_size)
+
+        # post_processing
+        self.post_num_layers = post_num_layers
+
+        self.post_layers = torch.nn.ModuleList()
+
+        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size, post_hidden_layer_size),
+                                torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                torch.nn.PReLU()))
+
+        for _ in range(post_num_layers - 2):
+            self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, post_hidden_layer_size),
+                                    torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                    torch.nn.PReLU()))
+
+        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), torch.nn.ReLU()))
+
+    def forward(self, x_dict, edge_index_dict):
+        # TODO Double check this
+        xs_dict: List[Tensor] = {k: [] for k, _ in x_dict.items()}
+        for i in range(self.num_layers):
+            x_dict = self.convs[i](x_dict, edge_index_dict)
+
+            if self.norms is not None:
+                for k, _ in x_dict.items():
+                    x_dict[k] = self.norms[i](x_dict[k])
+
+            if self.act is not None:
+                for k, _ in x_dict.items():
+                    x_dict[k] = self.act(x_dict[k])
+
+            for k, _ in x_dict.items():
+                x_dict[k] = torch.nn.functional.dropout(x_dict[k], p=self.dropout, training=self.training)
+
+            if hasattr(self, 'jk'):
+                for k, _ in x_dict.items():
+                    xs_dict[k].append(x_dict[k])
+
+        for k, _ in x_dict.items():
+            x_dict[k] = self.jk(xs_dict[k]) if hasattr(self, 'jk') else x_dict[k]
+            x_dict[k] = self.lin(x_dict[k]) if hasattr(self, 'lin') else x_dict[k]
+
+        # post_processing
+        x = x_dict['path']
+        for i in range(self.post_num_layers):
+            x = self.post_layers[i](x)
+
+        # Get path delays
+        # TODO: check if gradients are propagated correctly in this way (maybe find a differnt way using scatter ?)
+        # delays = torch.zeros(x_dict['path'].shape[0], dtype=torch.float)
+
+        # for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
+        #     link = edge_index_dict[('path', 'uses', 'link')][1][index]
+        #     delays.index_add_(0, path.cpu(), x[link][0].cpu())
+
+        return x
