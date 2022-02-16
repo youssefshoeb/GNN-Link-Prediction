@@ -1,3 +1,5 @@
+import urllib.request
+import tarfile
 import datanetAPI
 import os
 import torch
@@ -5,6 +7,26 @@ import torch_geometric
 import tqdm
 import numpy as np
 import networkx as nx
+
+
+def download_dataset(dataset_name, urls):
+    urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
+            'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
+            'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
+
+    os.makedirs(f'./data/{dataset_name}/', exist_ok=True)
+    os.makedirs(f'./data/{dataset_name}/raw', exist_ok=True)
+    os.makedirs(f'./data/{dataset_name}/processed', exist_ok=True)
+
+    print("Downloading dataset...")
+    for k, v in urls.items():
+        urllib.request.urlretrieve(v, f'./data/{dataset_name}/raw/{k}.tar.gz')
+
+    print("Extracting Tar-Files...")
+    for k, v in urls.items():
+        tar = tarfile.open(f'./data/{dataset_name}/raw/{k}.tar.gz')
+        tar.extractall(f'./data/{dataset_name}/raw')
+        tar.close()
 
 
 def generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle=False):
@@ -515,6 +537,11 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         self.val = val
         self.filename = filename
         self.dataset_name = "GNNCH21"
+        self.processed_dataset_name = 'gnnet-ch21-dataset-train'
+
+        self.urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
+                     'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
+                     'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
 
         super(GNNC21Dataset, self).__init__(root, transform, pre_transform)
 
@@ -524,7 +551,7 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
             (The download func. is not implemented here)
         """
         # Add the name of the dataset gnnet_data_set_training
-        return ['dummy.csv']
+        return [self.processed_dataset_name]
 
     @property
     def processed_file_names(self):
@@ -562,7 +589,7 @@ class GNNC21Dataset(torch_geometric.data.Dataset):
         return x
 
     def download(self):
-        raise NotImplementedError("Download function not implemented")
+        raise download_dataset(self.dataset_name, self.urls)
 
     def process(self):
         dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
@@ -675,6 +702,11 @@ class HETROGNNC21Dataset(torch_geometric.data.Dataset):
         self.val = val
         self.filename = filename
         self.dataset_name = "GNNCH21"
+        self.processed_dataset_name = 'gnnet-ch21-dataset-train'
+
+        self.urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
+                     'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
+                     'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
 
         super(HETROGNNC21Dataset, self).__init__(root, transform, pre_transform)
 
@@ -684,7 +716,7 @@ class HETROGNNC21Dataset(torch_geometric.data.Dataset):
             (The download func. is not implemented here)
         """
         # Add the name of the dataset gnnet_data_set_training
-        return ['dummy.csv']
+        return [self.processed_dataset_name]
 
     @property
     def processed_file_names(self):
@@ -722,7 +754,7 @@ class HETROGNNC21Dataset(torch_geometric.data.Dataset):
         return x
 
     def download(self):
-        raise NotImplementedError("Download function not implemented")
+        download_dataset(self.dataset_name, self.urls)
 
     def process(self):
         dataset = HETROTorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
@@ -856,6 +888,9 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         self.val = val
         self.filename = filename
         self.dataset_name = "GNNCH20"
+        self.urls = {'train': "https://bnn.upc.edu/download/ch20-training-dataset/",
+                     'val': "https://bnn.upc.edu/download/ch20-validation-dataset/",
+                     'test': "https://bnn.upc.edu/download/ch20-test-complete-dataset/"}
 
         super(GNNC20Dataset, self).__init__(root, transform, pre_transform)
 
@@ -865,7 +900,7 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
             (The download func. is not implemented here)
         """
         # Add the name of the dataset gnnet_data_set_training
-        return ['dummy.csv']
+        return ['gnnet_data_set_training']
 
     @property
     def processed_file_names(self):
@@ -906,7 +941,7 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
         return x
 
     def download(self):
-        raise NotImplementedError("Download function not implemented")
+        raise download_dataset(self.dataset_name, self.urls)
 
     def process(self):
         dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
