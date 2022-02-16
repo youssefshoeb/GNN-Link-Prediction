@@ -137,5 +137,11 @@ archive/
 # MLRuns
 mlruns/
 
+# wandb
+wandb/
+
+# runs
+runs/
+
 # vscode
 .vscode
