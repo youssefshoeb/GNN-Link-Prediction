@@ -3,11 +3,20 @@ import torch_geometric
 import numpy as np
 import mlflow
 import tqdm
+import random
 
 from dataset import HETROGNNC21Dataset
 from model import HetroGIN
 from torch_geometric.loader import DataLoader
 from config import *
+
+
+# Ensure deterministic behavior by setting random seed
+torch.backends.cudnn.deterministic = True
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
 
 def flatten(list):
