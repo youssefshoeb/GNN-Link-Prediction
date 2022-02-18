@@ -1,4 +1,5 @@
 import copy
+from sqlalchemy import true
 import torch
 import torch_geometric
 from typing import Optional, Callable, List, Any, Union
@@ -84,9 +85,6 @@ class GINConv(torch_geometric.nn.conv.MessagePassing):
 
 
 class GINLayer(torch.nn.Module):
-    """A single GIN layer consits of the GINConv layer followed by batch normalization
-    and prelu activation.
-    """
     def __init__(self, in_channels: int, out_channels: int, concat: bool = False) -> None:
         super().__init__()
 
@@ -94,7 +92,8 @@ class GINLayer(torch.nn.Module):
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(in_channels, out_channels),
             torch.nn.BatchNorm1d(out_channels),
-            torch.nn.ReLU(inplace=True),
+            # torch.nn.ReLU(inplace=True),
+            torch.nn.PReLU(),
             torch.nn.Linear(out_channels, out_channels)
         )
 
@@ -240,7 +239,8 @@ class HetroFastIDLineGIN(torch.nn.Module):
                  dropout: float = 0.0,
                  act: Optional[Callable] = torch.nn.ReLU(inplace=True),
                  norm: Optional[torch.nn.Module] = None, jk: str = 'last',
-                 post_hidden_layer_size: int = 16, post_num_layers: int = 2):
+                 post_hidden_layer_size: int = 16, post_num_layers: int = 2, post_head_act: Optional[Callable] = torch.nn.ReLU(inplace=True),
+                 concat_path: bool = True):
         super().__init__()
         self.embedding_size = embedding_size
         self.num_layers = num_layers
@@ -248,6 +248,7 @@ class HetroFastIDLineGIN(torch.nn.Module):
         self.act = act
         self.norm = norm
         self.jk_mode = jk
+        self.concat_path = concat_path
 
         self.convs = torch.nn.ModuleList()
 
@@ -281,20 +282,26 @@ class HetroFastIDLineGIN(torch.nn.Module):
 
         self.post_layers = torch.nn.ModuleList()
 
-        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size, post_hidden_layer_size),
-                                torch.nn.BatchNorm1d(post_hidden_layer_size),
-                                torch.nn.PReLU()))
+        if concat_path:
+            self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size + input_channels['path'], post_hidden_layer_size),
+                                    torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                    torch.nn.PReLU()))
+        else:
+            self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size, post_hidden_layer_size),
+                                    torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                    torch.nn.PReLU()))
 
         for _ in range(post_num_layers - 2):
             self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, post_hidden_layer_size),
                                     torch.nn.BatchNorm1d(post_hidden_layer_size),
                                     torch.nn.PReLU()))
 
-        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), torch.nn.ReLU()))
+        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), post_head_act))
 
     def forward(self, x_dict, edge_index_dict):
         # TODO Double check this
         xs_dict: List[Tensor] = {k: [] for k, _ in x_dict.items()}
+        origin_input = x_dict.copy()
         for i in range(self.num_layers):
             x_dict = self.convs[i](x_dict, edge_index_dict)
 
@@ -319,7 +326,11 @@ class HetroFastIDLineGIN(torch.nn.Module):
 
         # post_processing
         # x = x_dict['link']
-        x = x_dict['path']
+        # x = x_dict['path']
+        if self.concat_path:
+            x = torch.cat((origin_input['path'], x_dict['path']), 1)
+        else:
+            x = x_dict['path']
         for i in range(self.post_num_layers):
             x = self.post_layers[i](x)
 
@@ -340,7 +351,8 @@ class HetroGIN(torch.nn.Module):
                  dropout: float = 0.0,
                  act: Optional[Callable] = torch.nn.ReLU(inplace=True),
                  norm: Optional[torch.nn.Module] = None, jk: str = 'last',
-                 post_hidden_layer_size: int = 16, post_num_layers: int = 2):
+                 post_hidden_layer_size: int = 16, post_num_layers: int = 2, post_head_act: Optional[Callable] = torch.nn.ReLU(inplace=True),
+                 concat_path: bool = True):
         super().__init__()
         self.embedding_size = embedding_size
         self.num_layers = num_layers
@@ -348,6 +360,7 @@ class HetroGIN(torch.nn.Module):
         self.act = act
         self.norm = norm
         self.jk_mode = jk
+        self.concat_path = concat_path
 
         self.convs = torch.nn.ModuleList()
 
@@ -383,20 +396,26 @@ class HetroGIN(torch.nn.Module):
 
         self.post_layers = torch.nn.ModuleList()
 
-        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size, post_hidden_layer_size),
-                                torch.nn.BatchNorm1d(post_hidden_layer_size),
-                                torch.nn.PReLU()))
+        if self.concat_path:
+            self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size + input_channels['path'], post_hidden_layer_size),
+                                    torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                    torch.nn.PReLU()))
+        else:
+            self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(embedding_size, post_hidden_layer_size),
+                                    torch.nn.BatchNorm1d(post_hidden_layer_size),
+                                    torch.nn.PReLU()))
 
         for _ in range(post_num_layers - 2):
             self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, post_hidden_layer_size),
                                     torch.nn.BatchNorm1d(post_hidden_layer_size),
                                     torch.nn.PReLU()))
 
-        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), torch.nn.ReLU()))
+        self.post_layers.append(torch.nn.Sequential(torch.nn.Linear(post_hidden_layer_size, 1), post_head_act))
 
     def forward(self, x_dict, edge_index_dict):
         # TODO Double check this
         xs_dict: List[Tensor] = {k: [] for k, _ in x_dict.items()}
+        origin_input = x_dict.copy()
         for i in range(self.num_layers):
             x_dict = self.convs[i](x_dict, edge_index_dict)
 
@@ -420,7 +439,11 @@ class HetroGIN(torch.nn.Module):
             x_dict[k] = self.lin(x_dict[k]) if hasattr(self, 'lin') else x_dict[k]
 
         # post_processing
-        x = x_dict['path']
+        if self.concat_path:
+            x = torch.cat((origin_input['path'], x_dict['path']), 1)
+        else:
+            x = x_dict['path']
+
         for i in range(self.post_num_layers):
             x = self.post_layers[i](x)
 
@@ -431,5 +454,4 @@ class HetroGIN(torch.nn.Module):
         # for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
         #     link = edge_index_dict[('path', 'uses', 'link')][1][index]
         #     delays.index_add_(0, path.cpu(), x[link][0].cpu())
-
         return x
