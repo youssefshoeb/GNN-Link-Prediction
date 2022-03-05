@@ -7,6 +7,7 @@ import torch_geometric
 import tqdm
 import numpy as np
 import networkx as nx
+import os.path as osp
 
 
 def download_dataset(dataset_name, urls):
@@ -1072,6 +1073,159 @@ class GNNC20Dataset(torch_geometric.data.Dataset):
             data = torch.load(os.path.join(
                 self.processed_dir, f'data_{idx}.pt'))
         return data
+
+
+class NEWGNNCH21Dataset(torch_geometric.data.Dataset):
+    """
+    Base class representing a dataset for the challenge.
+
+    The conversion process is assumed to be done already done, i.e. we
+    work with a list of pytorch Data objects stored in .pt files,
+    all in the same folder.
+    """
+
+    def normalize(self, data):
+        data["link"].x[:, 0] = (
+            data["link"].x[:, 0] - 0.3546671) / 0.2083346
+        data["link"].x[:, 1] = (
+            data["link"].x[:, 1] - 0.16771736017268535) / 0.1974350417861857
+        data["link"].x[:, 2] = (
+            data["link"].x[:, 2] - 0.09862498490722958) / 0.179935315102362
+        data["path"].x[:, 0] = (
+            data["path"].x[:, 0] - 0.6577772) / 0.4192159
+        data["path"].x[:, 1] = (
+            data["path"].x[:, 1] - 0.6578069) / 0.4192953
+        data["path"].x[:, 2] = (
+            data["path"].x[:, 2] - 0.6578076) / 0.4193256
+
+        # data["path"].y = (
+        #    data["path"].y - 0) / (9.15503 - 0)
+
+        return data
+
+    def challenge_transform(self, data, graph_type, converted_path=None):
+
+        # Features to be removed from paths
+        del data.p_SizeDist, data.p_TimeDist, data.p_ToS, data.p_size_AvgPktSize, data.p_size_PktSize1, data.p_size_PktSize2, data.p_time_ExpMaxFactor
+        # Features to be removed from nodes
+        del data.n_queueSizes, data.n_levelsQoS, data.n_schedulingPolicy, data.n_schedulingPolicy
+
+        """
+        2. Path attributes;
+        """
+
+        timeparams = [f'p_time_{a}' for a in ['EqLambda', 'AvgPktsLambda']]
+
+        p_params = timeparams + ['p_PktsGen', 'p_AvgBw']
+
+        mean_pkts_rate = data.p_time_AvgPktsLambda.mean().item()
+
+        # remove p_TotalPktsGen
+        del data.p_TotalPktsGen
+
+        assert mean_pkts_rate > 0
+        # Divide all path parameters with AvgPktsLambda
+        for p in p_params:
+            setattr(data, p + '_origin', getattr(data, p))
+
+        for p in p_params:
+            setattr(data, p, getattr(data, p) / mean_pkts_rate)
+
+        # normalize path attributes
+        data.p_time_EqLambda_origin /= 1000.0
+        data.p_AvgBw_origin /= 1000.0
+
+        """
+        Time parameters: Total Packets Generated (unused)
+                         EqLambda (we divide by 1000)
+                         Packets Generated
+                         Average Packets Generated
+                         Average Bandwidth (we divide by 1000)
+        """
+        """
+            3. Global Attributes
+        """
+        global_attrs = ['g_delay', 'g_packets', 'g_losses', 'g_AvgPktsLambda']
+        for a in global_attrs:
+            delattr(data, a)
+
+        """
+            4. Link attributes
+        """
+        # Create data object
+        torch_data = torch_geometric.data.HeteroData()
+        # Get node features and labels
+        # l_params = ['l_link_load', 'l_link_load2', 'l_link_load3', 'l_capacity']
+        l_params = ['l_link_load', 'l_link_load2', 'l_link_load3']
+        torch_data['link'].x = torch.cat([getattr(data, a).view(-1, 1) for a in l_params], axis=1)  # [num_link, num_features_link]
+        # p_params = ['p_time_EqLambda', 'p_PktsGen', 'p_AvgBw', 'p_time_EqLambda_origin', 'p_PktsGen_origin', 'p_AvgBw_origin', 'p_time_AvgPktsLambda_origin']
+        p_params = ['p_time_EqLambda_origin', 'p_PktsGen_origin', 'p_AvgBw_origin']
+        torch_data['path'].x = torch.cat([getattr(data, a).view(-1, 1) for a in p_params], axis=1)   # [num_path, num_features_path]
+        num_node_nodes = (data.num_nodes - int(torch_data['path'].x.shape[0]) - int(torch_data['link'].x.shape[0]))
+        if self.graph_type == 'hetero':
+            torch_data['node'].x = torch.ones((num_node_nodes, 3))
+
+        if self.graph_type == 'hetero':
+            # Get adjacency info
+            torch_data['path', 'uses', 'link'].edge_index = data['p-l']
+            torch_data['link', 'includes', 'path'].edge_index = data['l-p']
+            torch_data['link', 'connects', 'node'].edge_index = data['l-n']
+            torch_data['node', 'has', 'link'].edge_index = data['n-l']
+        else:
+            # Get adjacency info
+            torch_data['path', 'uses', 'link'].edge_index = data['p-l']
+            torch_data['link', 'includes', 'path'].edge_index = data['l-p']
+            torch_data['link', 'connects', 'link'].edge_index = data['l-l']
+
+        # Label
+        torch_data['path'].y = data['out_delay']
+
+        torch_data = self.normalize(torch_data)
+        if converted_path is not None:
+            torch.save(torch_data, converted_path)
+
+        return torch_data
+
+    def __init__(self, root_dir, graph_type, convert_files, filenames=None):
+        """
+        Args:
+            csv_file (string): Path to the csv file with annotations.
+            root_dir (string): Directory with all the .pt files.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.graph_type = graph_type  # 'hetero/line'
+        self.convert_files = convert_files
+        self.root_dir = root_dir
+        if filenames is None:
+            onlyfiles = [f for f in os.listdir(self.root_dir) if osp.isfile(osp.join(self.root_dir, f))]
+            self.filenames = [f for f in onlyfiles if f.endswith('.pt')]
+        else:
+            self.filenames = filenames
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        filename = self.filenames[idx]
+        pt_path = osp.join(self.root_dir, filename)
+
+        converted_dir = self.root_dir + f'_{self.graph_type}'
+
+        converted_path = osp.join(converted_dir, filename)
+
+        # transform converted paths
+        if self.convert_files:
+            sample = torch.load(pt_path, map_location='cpu')
+            sample = self.challenge_transform(sample, self.graph_type, converted_path=converted_path)
+        else:
+            # load converted data
+            sample = torch.load(converted_path, map_location='cpu')
+
+        return sample
 
 
 """
