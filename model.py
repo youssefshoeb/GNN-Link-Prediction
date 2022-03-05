@@ -449,9 +449,10 @@ class HetroGIN(torch.nn.Module):
 
         # Get path delays
         # TODO: check if gradients are propagated correctly in this way (maybe find a differnt way using scatter ?)
-        # delays = torch.zeros(x_dict['path'].shape[0], dtype=torch.float)
+        # delays = torch.zeros(x_dict['path'].shape[0], dtype=torch.float).to('cuda:0')
 
         # for index, path in enumerate(edge_index_dict[('path', 'uses', 'link')][0]):
         #     link = edge_index_dict[('path', 'uses', 'link')][1][index]
-        #     delays.index_add_(0, path.cpu(), x[link][0].cpu())
+        #     delays.index_add_(0, path, x[link][0])
+
         return x
