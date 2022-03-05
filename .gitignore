@@ -130,6 +130,7 @@ dmypy.json
 
 # Dataset
 data/
+dataset/
 
 # Archive
 archive/
@@ -145,3 +146,7 @@ runs/
 
 # vscode
 .vscode
+
+#configs
+configs/
+script
