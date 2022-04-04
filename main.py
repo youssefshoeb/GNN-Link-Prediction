@@ -1,13 +1,16 @@
 import os
 import urllib.request
 import tarfile
-
 import torch
 import torch_geometric
 import re
 import datanetAPI
 import multiprocessing
 import tqdm
+import argparse
+import json
+import random
+import wandb
 
 import numpy as np
 import pandas as pd
@@ -31,7 +34,7 @@ urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
         'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"
         }
 
-PROJECT_NAME = "PARANA2.0"
+PROJECT_NAME = "PARANA2.0-BL"
 
 CONVERTED_DIRS = {'train': './dataset/converted_train',
                   'validation': './dataset/converted_validation',
@@ -42,8 +45,6 @@ RAW_DIRS = {'train': './dataset/gnnet-ch21-dataset-train',
             'validation': './dataset/gnnet-ch21-dataset-validation',
             'test': './dataset/gnnet-ch21-dataset-test'
             }
-
-BATCH_SIZE = {'train': 8, 'val': 1}
 
 
 """
@@ -339,7 +340,7 @@ class GNN21Dataset(Dataset):
 
         return data
 
-    def preprocess(self, data, converted_path):
+    def preprocess(self, data, bl_features, converted_path):
         # Remove features that have same value across different nodes/simulations
         del data.p_SizeDist, data.p_TimeDist, data.p_ToS, data.p_time_ExpMaxFactor, data.p_TotalPktsGen, data.EqLambda, data.PktSize2, data.PktSize1, data.AvgPktSize
         del data.n_queueSizes, data.n_levelsQoS, data.n_schedulingPolicy
@@ -369,14 +370,16 @@ class GNN21Dataset(Dataset):
         torch_data = torch_geometric.data.HeteroData()
         l_params = ['l_link_load', 'l_link_load2', 'l_link_load3']
         torch_data['link'].x = torch.cat([getattr(data, a).view(-1, 1) for a in l_params], axis=1)
-        torch_data['link'].x = torch.cat([torch_data['link'].x, b_occup], axis=1)  # add baseline link features
 
         p_params = ['p_time_AvgPktsLambda', 'p_PktsGen', 'p_AvgBw']
         torch_data['path'].x = torch.cat([getattr(data, a).view(-1, 1) for a in p_params], axis=1)
-        torch_data['path'].x = torch.cat([torch_data['path'].x, b_out.reshape((-1, 1))], axis=1)  # add baseline path feature
 
         num_node_nodes = (data.num_nodes - int(torch_data['path'].x.shape[0]) - int(torch_data['link'].x.shape[0]))
         torch_data['node'].x = torch.ones((num_node_nodes, 3))
+
+        if bl_features:
+            torch_data['link'].x = torch.cat([torch_data['link'].x, b_occup], axis=1)  # add baseline link features
+            torch_data['path'].x = torch.cat([torch_data['path'].x, b_out.reshape((-1, 1))], axis=1)  # add baseline path feature
 
         # Label
         torch_data['path'].y = data['out_delay']
@@ -395,9 +398,11 @@ class GNN21Dataset(Dataset):
 
         return torch_data
 
-    def __init__(self, root_dir, convert_files, filenames=None):
+    def __init__(self, root_dir, bl_features, normalize_dataset, convert_files, filenames=None):
         self.root_dir = root_dir
         self.convert_files = convert_files
+        self.normalize_dataset = normalize_dataset
+        self.bl_features = bl_features
 
         self.baseline = QTBaseline()
 
@@ -425,25 +430,28 @@ class GNN21Dataset(Dataset):
         # if convert_files is False then load saved processed file to save time
         if self.convert_files:
             sample = torch.load(pt_path, map_location='cpu')
-            sample = self.preprocess(sample, converted_path=converted_path)
+            sample = self.preprocess(sample, self.bl_features, converted_path=converted_path)
         else:
             sample = torch.load(converted_path, map_location='cpu')
-            # sample = self.normalize(sample)
 
+        if self.normalize_dataset:
+            sample = self.normalize(sample)
         return sample
 
 
-def preprocess_dataset():
+def preprocess_dataset(config):
     """
     Pass through the dataset to preprocess the dataset and save the processed objects
     """
-    train_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['train'], convert_files=True)
-    val_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=True)
-    test_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['test'], convert_files=True)
+    normalize_dataset = config["NORMALIZE_DATASET"]
+    bl_features = config["BL_FEATURES"]
+    train_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['train'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=True)
+    val_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=True)
+    test_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['test'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=True)
 
-    train_loader = torch_geometric.loader.DataLoader(train_dataset, batch_size=16, shuffle=False)
-    val_loader = torch_geometric.loader.DataLoader(val_dataset, batch_size=2, shuffle=False)
-    test_loader = torch_geometric.loader.DataLoader(test_dataset, batch_size=2, shuffle=False)
+    train_loader = torch_geometric.loader.DataLoader(train_dataset, batch_size=config["TRAIN_BATCH_SIZE"], shuffle=False)
+    val_loader = torch_geometric.loader.DataLoader(val_dataset, batch_size=config["VAL_BATCH_SIZE"], shuffle=False)
+    test_loader = torch_geometric.loader.DataLoader(test_dataset, batch_size=config["VAL_BATCH_SIZE"], shuffle=False)
     i = 0
 
     for _ in tqdm(train_loader):
@@ -487,27 +495,29 @@ def seperate_validation_dataset(filenames, path_to_original_dataset):
     return df
 
 
-def initDataset():
-    ds_val = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False)
+def initDataset(config):
+    normalize_dataset = config["NORMALIZE_DATASET"]
+    bl_features = config["BL_FEATURES"]
+    ds_val = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=False)
 
     df_val = seperate_validation_dataset(ds_val.filenames, RAW_DIRS['validation'])
 
     df_val['filenames'] = df_val.index.values
 
-    datasets = {  # "train": GNN21Dataset(root_dir=CONVERTED_DIRS['train'], convert_files=False),
-                  "val": GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False),
-                  "test": GNN21Dataset(root_dir=CONVERTED_DIRS['test'], convert_files=False)}
+    datasets = {"train": GNN21Dataset(root_dir=CONVERTED_DIRS['train'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=False),
+                "val": GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=False),
+                "test": GNN21Dataset(root_dir=CONVERTED_DIRS['test'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=False)}
     for i in range(3):
         which_files = list(df_val[df_val['validation_setting'] == i + 1]['filenames'].values)
-        ds = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False, filenames=which_files)
+        ds = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], bl_features=bl_features, normalize_dataset=normalize_dataset, convert_files=False, filenames=which_files)
         datasets[f'val_{i+1}'] = ds
 
     dataloaders = {}
     for k in datasets.keys():
         if k.startswith('train'):
-            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=BATCH_SIZE['train'], shuffle=True)
+            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=config["TRAIN_BATCH_SIZE"], shuffle=True)
         else:
-            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=BATCH_SIZE['val'], shuffle=False)
+            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=config["VAL_BATCH_SIZE"], shuffle=False)
 
     return datasets, dataloaders
 
@@ -750,36 +760,73 @@ class GINLayer(torch.nn.Module):
 
 
 class HetroGIN(torch.nn.Module):
-    def __init__(self, input_channels: dict):
+    def __init__(self, input_channels: dict, node_embedding_size: int, message_passing_layers: int, concat_path: bool,
+                 mlp_layers: list, act, mlp_head_act, mlp_bn: bool):
         super().__init__()
-        embedding_size = 8
-        self.num_layers = 1
+        self.num_layers = message_passing_layers
+        self.concat_path = concat_path
+        self.mlp_layers = mlp_layers
 
         self.convs = torch.nn.ModuleList()
+        self.readout = torch.nn.ModuleList()
 
         # Message Passing
         # first conv layer
         self.convs.append(HeteroConv({
-            ('path', 'uses', 'link'): GINLayer(input_channels['path'] + input_channels['link'], embedding_size, concat=True),
-            ('link', 'includes', 'path'): GINLayer(input_channels['link'] + input_channels['path'], embedding_size, concat=True),
-            ('link', 'connects', 'node'): GINLayer(input_channels['link'] + input_channels['node'], embedding_size, concat=True),
-            ('node', 'has', 'link'): GINLayer(input_channels['node'] + input_channels['link'], embedding_size, concat=True)}, aggr='sum'))
+            ('path', 'uses', 'link'): GINLayer(input_channels['path'] + input_channels['link'], node_embedding_size, concat=True),
+            ('link', 'includes', 'path'): GINLayer(input_channels['link'] + input_channels['path'], node_embedding_size, concat=True),
+            ('link', 'connects', 'node'): GINLayer(input_channels['link'] + input_channels['node'], node_embedding_size, concat=True),
+            ('node', 'has', 'link'): GINLayer(input_channels['node'] + input_channels['link'], node_embedding_size, concat=True)}, aggr='sum'))
 
         # remaining conv layers
         for _ in range(self.num_layers - 1):
             self.convs.append(HeteroConv({
-                ('path', 'uses', 'link'): GINLayer(embedding_size, embedding_size),
-                ('link', 'includes', 'path'): GINLayer(embedding_size, embedding_size),
-                ('link', 'connects', 'node'): GINLayer(embedding_size, embedding_size),
-                ('node', 'has', 'link'): GINLayer(embedding_size, embedding_size)}, aggr='sum'))
+                ('path', 'uses', 'link'): GINLayer(node_embedding_size, node_embedding_size),
+                ('link', 'includes', 'path'): GINLayer(node_embedding_size, node_embedding_size),
+                ('link', 'connects', 'node'): GINLayer(node_embedding_size, node_embedding_size),
+                ('node', 'has', 'link'): GINLayer(node_embedding_size, node_embedding_size)}, aggr='sum'))
 
         # Readout Layer
-        self.readout = torch.nn.Sequential(torch.nn.Linear(embedding_size + input_channels['path'], 128),
-                                           torch.nn.PReLU(),
-                                           torch.nn.Linear(128, 32),
-                                           torch.nn.PReLU(),
-                                           torch.nn.Linear(32, 1)
-                                           )
+        act = eval(act)
+        for i in range(len(mlp_layers)):
+            if mlp_bn:
+                if i == 0:
+                    if concat_path:
+                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
+                                                                torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                                act
+                                                                ))
+                    else:
+                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
+                                                                torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                                act
+                                                                ))
+                else:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
+                                                            torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                            act
+                                                            ))
+
+            else:
+                if i == 0:
+                    if concat_path:
+                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
+                                                                act
+                                                                ))
+                    else:
+                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
+                                                                act
+                                                                ))
+                else:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
+                                                            act
+                                                            ))
+
+        if mlp_head_act is None:
+            self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[-1], 1)))
+        else:
+            self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[-1], 1),
+                                                    eval(mlp_head_act)))
 
     def forward(self, x_dict, edge_index_dict):
 
@@ -789,9 +836,13 @@ class HetroGIN(torch.nn.Module):
             x_dict = self.convs[i](x_dict, edge_index_dict)
 
         # readout
-        x = torch.cat((x_dict['path'], origin_input['path']), 1)
+        if self.concat_path:
+            x = torch.cat((x_dict['path'], origin_input['path']), 1)
+        else:
+            x = x_dict['path']
 
-        x = self.readout[i](x)
+        for i in range(len(self.mlp_layers) + 1):
+            x = self.readout[i](x)
 
         return x
 
@@ -801,35 +852,23 @@ Train
 """
 
 
-def save_best_model(model):
-    os.makedirs("./runs", exist_ok=True)
-
-    print("Saving new best model ...")
-    model = model.to("cpu")
-
-    if not os.path.exists(f'./runs/{PROJECT_NAME}'):
-        os.mkdir(f'runs/{PROJECT_NAME}')
-    torch.save(model.state_dict(), f'./runs/{PROJECT_NAME}/best_model.pth')
-    model = model.cuda()
-
-
-def MAPE(preds, actuals):
+def mape(preds, actuals):
     return 100.0 * torch.mean(torch.abs((preds - actuals) / actuals))
 
 
-def train_one_epoch(epoch, dataloader, model):
-    all_preds = []
-    all_labels = []
+def train_one_epoch(epoch, loss_func, opt, dataloader, model, k=None):
     running_loss = 0.0
     step = 0
 
-    opt = torch.optim.Adam(lr=1e-3, params=model.parameters())
+    running_loss_mape = 0.0
+    step_mape = 0
 
     # Enumerate over the data
     total = len(dataloader)
     for sample in tqdm(dataloader, total=total):
         # Train model
         with torch.set_grad_enabled(True):
+            sample.cuda()
 
             # Reset Gradients
             opt.zero_grad()
@@ -839,112 +878,167 @@ def train_one_epoch(epoch, dataloader, model):
 
             # Calculate loss and gradients
             label = sample['path'].y.reshape(-1, 1)
-            loss_value = MAPE(out, label)
+            loss_value = loss_func(out, label)
 
             loss = torch.sqrt(loss_value)
             loss.backward()
             opt.step()
 
             # Update Tracking
-            running_loss += loss_value.item()
+            running_loss += loss_value
             step += 1
-            # all_preds.append(out.cpu().detach().numpy())
-            # all_labels.append(label.cpu().detach().numpy())
 
-    # Calculate MAPE
-    # all_preds = np.concatenate(all_preds).ravel()
-    # all_labels = np.concatenate(all_labels).ravel()
+            running_loss_mape += mape(out, label).item() * sample["path"].x.shape[0]  # TODO Double check this
+            step_mape += sample["path"].x.shape[0]
 
-    # mape_value = MAPE(torch.from_numpy(all_preds), torch.from_numpy(all_labels))
     average_loss = running_loss / step
+    mape_loss = running_loss_mape / step_mape
 
     print(f"Epoch {epoch+1} | Train Loss {average_loss}")
-
-    # print(f"MAPE-Train: {mape_value}")
+    print(f"MAPE-Train: {mape_loss}")
+    if k is not None:
+        wandb.log({f"MAPE-Train - {k}": float(mape_loss), "Epoch": epoch + 1})
+        wandb.log({f"Train loss - {k}": float(average_loss), "Epoch": epoch + 1})
+    else:
+        wandb.log({f"MAPE-Train": float(mape_loss), "Epoch": epoch + 1})
+        wandb.log({"Train loss": float(average_loss), "Epoch": epoch + 1})
 
     torch.cuda.empty_cache()
 
     return
 
 
-def test(epoch, dataloader, model, mode):
+def test(epoch, loss_func, dataloader, model, mode, k=None):
     all_preds = []
     all_labels = []
 
     running_loss = 0.0
     step = 0
 
+    running_loss_mape = 0.0
+    step_mape = 0
+
     with torch.no_grad():
         # Enumerate over the data
         for sample in tqdm(dataloader):
+            sample.cuda()
             with torch.set_grad_enabled(False):
                 out = model(sample.x_dict, sample.edge_index_dict)
 
                 # Get label
                 label = sample['path'].y.reshape(-1, 1)
-                loss_value = MAPE(out, label)
+                loss_value = loss_func(out, label)
 
                 # Update Tracking
                 running_loss += loss_value.item()
                 step += 1
-                # all_preds.append(out.cpu().detach().numpy())
-                # all_labels.append(label.cpu().detach().numpy())
 
-        # all_preds = np.concatenate(all_preds).ravel()
-        # all_labels = np.concatenate(all_labels).ravel()
+                running_loss_mape += mape(out, label).item() * sample["path"].x.shape[0]
+                step_mape += sample["path"].x.shape[0]
+                all_preds.append(out.cpu().detach().numpy())
+                all_labels.append(label.cpu().detach().numpy())
 
-        # mape_value = MAPE(torch.from_numpy(all_preds), torch.from_numpy(all_labels))
         average_loss = running_loss / step
+        mape_loss = running_loss_mape / step_mape
 
         print(f"Epoch {epoch+1} | {mode} Loss {average_loss}")
+        print(f"MAPE-{mode}: {mape_loss}")
 
-        # print(f"MAPE-{mode}: {mape_value}")
+        if k is not None:
+            wandb.log({f"MAPE-{mode}-{k}": float(mape_loss), "Epoch": epoch + 1})
+            wandb.log({f"Validation loss-{k}": float(average_loss), "Epoch": epoch + 1})
+        else:
+            wandb.log({f"MAPE-{mode}": float(mape_loss), "Epoch": epoch + 1})
+            wandb.log({f"{mode} loss": float(average_loss), "Epoch": epoch + 1})
 
         return average_loss
 
 
-def train():
-    print("Loading Dataset...")
-    datasets, dataloaders = initDataset()
+def load_model(config, datasets):
+    input_channels = {'link': datasets["train"][0]['link']['x'].shape[1],
+                      'path': datasets["train"][0]['path']['x'].shape[1],
+                      'node': datasets["train"][0]['node']['x'].shape[1]}
+    model = HetroGIN(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
+                     message_passing_layers=config['MP_LAYERS'], concat_path=config['CONCAT_PATH'], mlp_layers=config['MLP_LAYERS'],
+                     act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
 
-    print("Loading model...")
-    input_channels = {'link': datasets["train"][0]['link']['x'].shape[1], 'path': datasets["train"][0]['path']['x'].shape[1], 'node': datasets["train"][0]['node']['x'].shape[1]}
-    model = HetroGIN(input_channels=input_channels)
-
-    num_epochs = 10
-    step = 0
-
-    # Start training
-    best_loss = np.inf
-    for epoch in range(num_epochs):
-        model.train()
-        # Train
-        train_one_epoch(epoch, dataloaders['train'], model)
-
-        model.eval()
-        # Evaluation on validation set 1
-        test(epoch, dataloaders['val_1'], model, "Validation_1")
-
-        # Evaluation on validation set 2
-        test(epoch, dataloaders['val_2'], model, "Validation_2")
-
-        # Evaluation on validation set 3
-        test(epoch, dataloaders['val_3'], model, "Validation_3")
-
-        # Evaluation on validation set
-        loss = test(epoch, dataloaders['val'], model, "Validation")
-
-        # Update best loss
-        if loss < best_loss:
-            best_loss = loss
-            save_best_model(model)
+    return model
 
 
-def test_baseline():
+def load_optmizer(config, model):
+    if config['OPTIMIZER'] == 'adam':
+        return torch.optim.Adam(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+    if config['OPTIMIZER'] == 'adamW':
+        return torch.optim.AdamW(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+    if config['OPTIMIZER'] == 'sgd':
+        return torch.optim.SGD(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+
+def save_best_model(model, run):
+    os.makedirs("./runs", exist_ok=True)
+
+    print("Saving new best model ...")
+    model = model.to("cpu")
+
+    if not os.path.exists(f'runs/{run.name}'):
+        os.mkdir(f'runs/{run.name}')
+    torch.save(model.state_dict(), f'runs/{run.name}/best_model.pth')
+    model = model.cuda()
+
+
+def train(config):
     print(f"Torch version: {torch.__version__}")
     print(f"Cuda available: {torch.cuda.is_available()}")
     print(f"Torch geometric version: {torch_geometric.__version__}")
 
+    with wandb.init(project=config['PROJECT_NAME'], entity="youssefshoeb", config=config) as run:
+        # Access all hyperparameters through wandb.config, so logging matches execution
+        config = wandb.config
+
+        print("Loading Dataset...")
+        datasets, dataloaders = initDataset(config)
+
+        print("Loading model...")
+        model = load_model(config, datasets)
+        model.cuda()
+
+        # Hyperparameters
+        num_epochs = config["EPOCHS"]
+        loss_func = eval(config["LOSS"])
+
+        opt = load_optmizer(config, model)
+
+        # Start training
+        best_loss = np.inf
+        for epoch in range(num_epochs):
+            model.train()
+            # Train
+            train_one_epoch(epoch, loss_func, opt, dataloaders['train'], model)
+
+            model.eval()
+            # Evaluation on validation set 1
+            test(epoch, loss_func, dataloaders['val_1'], model, "Validation_1")
+
+            # Evaluation on validation set 2
+            test(epoch, loss_func, dataloaders['val_2'], model, "Validation_2")
+
+            # Evaluation on validation set 3
+            test(epoch, loss_func, dataloaders['val_3'], model, "Validation_3")
+
+            # Evaluation on validation set
+            loss = test(epoch, loss_func, dataloaders['val'], model, "Validation")
+
+            # Update best loss
+            if loss < best_loss:
+                best_loss = loss
+                save_best_model(model, run)
+
+        return run.name
+
+
+def test_baseline():
     _, dataloaders = initDataset()
 
     # Train
@@ -961,7 +1055,7 @@ def test_baseline():
     all_preds = torch.from_numpy(np.concatenate(all_preds).ravel())
     all_labels = torch.from_numpy(np.concatenate(all_labels).ravel())
 
-    loss = MAPE(all_preds, all_labels)
+    loss = mape(all_preds, all_labels)
     print('Test', loss)
 
     torch.cuda.empty_cache()
@@ -976,16 +1070,16 @@ def test_baseline():
     """
 
 
-def evaluate(filename):
-    datasets, dataloaders = initDataset()
+def evaluate(config, filename):
+    datasets, dataloaders = initDataset(config)
 
-    print("Loading model...")
-    input_channels = {'link': datasets["train"][0]['link']['x'].shape[1], 'path': datasets["train"][0]['path']['x'].shape[1], 'node': datasets["train"][0]['node']['x'].shape[1]}
-    model = HetroGIN(input_channels=input_channels)
+    model = load_model(config, datasets)
 
-    model.load_state_dict(torch.load(f'./runs/{filename}//best_model.pth'))
+    model.load_state_dict(torch.load(f'./runs/{filename}/best_model.pth'))
 
     model.eval()
+    running_loss = 0.0
+    step = 0
 
     for _, sample in tqdm(enumerate(dataloaders['test']), total=len(dataloaders['test'])):
         with torch.set_grad_enabled(False):
@@ -993,7 +1087,7 @@ def evaluate(filename):
 
             # Get label
             label = sample['path'].y.reshape(-1, 1)
-            loss_value = MAPE(out, label)
+            loss_value = mape(out, label)
 
             # Update Tracking
             running_loss += loss_value.item()
@@ -1002,25 +1096,64 @@ def evaluate(filename):
     average_loss = running_loss / step
 
     print('Test', average_loss)
+    # wandb.log({f"Test loss": float(average_loss), "Epoch": 0})
+
+
+"""
+Main Method
+"""
+
+
+def set_random_seed(seed):
+    # Ensure deterministic behavior by setting random seed
+    torch.backends.cudnn.deterministic = True
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+
+    return
 
 
 if __name__ == "__main__":
+    # instantiate parser
+    parser = argparse.ArgumentParser(description='Required files for training.')
+
+    # Required hyperparameters path argument
+    parser.add_argument('--config_file', type=str,
+                        help='Config json file containing hyperparameters')
+
+    args = parser.parse_args()
+    # load hyperparameters
+    with open(args.config_file) as data_file:
+        json_config = json.load(data_file)
+
+    set_random_seed(json_config['SEED'])
 
     # Download & extract dataset
-    download_dataset()
-    extract_tarfiles()
+    # download_dataset()
+    # extract_tarfiles()
 
     # Generate torch files
-    generate_files()
+    # generate_files()
 
     # Preprocess the dataset
-    preprocess_dataset()
+    # the data is preprocessed with the baseline features so to remove the baseline features it needs to be re-processed
+    if json_config['BL_FEATURES'] is False:
+        preprocess_dataset(json_config)
 
     # Test Baseline
-    test_baseline()
+    # test_baseline()
 
     # Train
-    train()
+    run_name = train(json_config)
 
     # Test Final Model
-    evaluate(PROJECT_NAME)
+    evaluate(json_config, run_name)  # TODO
+
+    # Return dataset to one with baseline features
+    if json_config['BL_FEATURES'] is False:
+        json_config['BL_FEATURES'] = True
+        preprocess_dataset(json_config)

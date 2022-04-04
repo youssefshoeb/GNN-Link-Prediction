@@ -1,0 +1,27 @@
+{
+    "SEED":1997,
+
+    "LOSS":"mape",
+    "OPTIMIZER":"adam",
+    "LEARNING_RATE":0.001,
+    "WEIGHT_DECAY":0,
+
+    "NODE_EMBEDDING_SIZE":8,
+    "MP_LAYERS":1,
+
+    "EPOCHS":10,
+    "TRAIN_BATCH_SIZE":8,
+    "VAL_BATCH_SIZE":1,
+    "NORMALIZE_DATASET":false,
+    "BL_FEATURES":false,
+    
+    "CONCAT_PATH": true,
+    "MLP_LAYERS":[128,32],
+    "MLP_ACT":"torch.nn.PReLU()",
+    "MLP_BN":true,
+    "MLP_HEAD_ACT":null, 
+
+    "PROJECT_NAME":"HETRO-GNN-BL"
+
+    
+}
