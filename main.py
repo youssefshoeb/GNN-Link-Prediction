@@ -1,9 +1,12 @@
+from importlib.resources import path
 import os
 import urllib.request
 import tarfile
 import torch
 import torch_geometric
 import re
+
+import torch_scatter
 import datanetAPI
 import multiprocessing
 import tqdm
@@ -18,7 +21,7 @@ import networkx as nx
 import os.path as osp
 
 from torch_geometric.data import Dataset
-from torch_geometric.nn.conv import GINConv
+from torch_geometric.nn.conv import GINConv, GATConv
 from torch_geometric.utils import to_dense_adj
 from typing import Callable, Any, Union
 from torch.functional import Tensor
@@ -33,8 +36,6 @@ urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
         'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
         'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"
         }
-
-PROJECT_NAME = "PARANA2.0-BL"
 
 CONVERTED_DIRS = {'train': './dataset/converted_train',
                   'validation': './dataset/converted_validation',
@@ -413,6 +414,12 @@ class GNN21Dataset(Dataset):
             self.filenames = filenames
 
     def __len__(self):
+        """
+        if self.root_dir == CONVERTED_DIRS['train']:
+            return 1000 # len(self.filenames)
+        else:
+            return len(self.filenames)
+        """
         return len(self.filenames)
 
     def __getitem__(self, idx):
@@ -760,12 +767,24 @@ class GINLayer(torch.nn.Module):
 
 
 class HetroGIN(torch.nn.Module):
-    def __init__(self, input_channels: dict, node_embedding_size: int, message_passing_layers: int, concat_path: bool,
+    def __init__(self, input_channels: dict, node_embedding_size: int, message_passing_layers: int, dropout: float, concat_path: bool, global_feats: bool,
                  mlp_layers: list, act, mlp_head_act, mlp_bn: bool):
         super().__init__()
         self.num_layers = message_passing_layers
         self.concat_path = concat_path
         self.mlp_layers = mlp_layers
+        self.dropout = dropout
+        self.global_feats = global_feats
+
+        if global_feats:
+            self.global_feats_size = 8
+        else:
+            self.global_feats_size = 0
+
+        if concat_path:
+            self.concat_size = input_channels['path']
+        else:
+            self.concat_size = 0
 
         self.convs = torch.nn.ModuleList()
         self.readout = torch.nn.ModuleList()
@@ -791,16 +810,10 @@ class HetroGIN(torch.nn.Module):
         for i in range(len(mlp_layers)):
             if mlp_bn:
                 if i == 0:
-                    if concat_path:
-                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
-                                                                torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
-                                                                act
-                                                                ))
-                    else:
-                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
-                                                                torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
-                                                                act
-                                                                ))
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + self.concat_size + self.global_feats_size, mlp_layers[i]),
+                                                            torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                            act
+                                                            ))
                 else:
                     self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
                                                             torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
@@ -809,14 +822,10 @@ class HetroGIN(torch.nn.Module):
 
             else:
                 if i == 0:
-                    if concat_path:
-                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
-                                                                act
-                                                                ))
-                    else:
-                        self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + input_channels['path'], mlp_layers[i]),
-                                                                act
-                                                                ))
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size + self.concat_size + self.global_feats_size, mlp_layers[i]),
+                                                            act
+                                                            ))
+
                 else:
                     self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
                                                             act
@@ -828,18 +837,143 @@ class HetroGIN(torch.nn.Module):
             self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[-1], 1),
                                                     eval(mlp_head_act)))
 
-    def forward(self, x_dict, edge_index_dict):
+    def forward(self, x_dict, edge_index_dict, path_batch):
 
         origin_input = x_dict.copy()
+
+        if self.global_feats:
+            mean_global_feats = torch_geometric.nn.global_mean_pool(origin_input["path"], path_batch)
+            mean_global_max = torch_geometric.nn.global_max_pool(origin_input["path"], path_batch)
+
+            mean_global_feats = torch.gather(mean_global_feats, 0, path_batch.unsqueeze(1).repeat(1, mean_global_feats.shape[1]))
+            mean_global_max = torch.gather(mean_global_max, 0, path_batch.unsqueeze(1).repeat(1, mean_global_max.shape[1]))
+
         # message passing
         for i in range(self.num_layers):
             x_dict = self.convs[i](x_dict, edge_index_dict)
 
+            for k, _ in x_dict.items():
+                x_dict[k] = torch.nn.functional.dropout(x_dict[k], p=self.dropout, training=self.training)
+
         # readout
         if self.concat_path:
-            x = torch.cat((x_dict['path'], origin_input['path']), 1)
+            if self.global_feats:
+                x = torch.cat((x_dict['path'], origin_input['path'], mean_global_feats, mean_global_max), 1)
+            else:
+                x = torch.cat((x_dict['path'], origin_input['path']), 1)
         else:
-            x = x_dict['path']
+            if self.global_feats:
+                x = torch.cat((x_dict['path'], mean_global_feats, mean_global_max), 1)
+            else:
+                x = x_dict['path']
+
+        for i in range(len(self.mlp_layers) + 1):
+            x = self.readout[i](x)
+
+        return x
+
+
+class HetroGAT(torch.nn.Module):
+    def __init__(self, input_channels: dict, node_embedding_size: int, message_passing_layers: int, dropout: float, heads: int, concat_path: bool, global_feats: bool,
+                 mlp_layers: list, act, mlp_head_act, mlp_bn: bool):
+        super().__init__()
+        self.num_layers = message_passing_layers
+        self.dropout = dropout
+        self.concat_path = concat_path
+        self.mlp_layers = mlp_layers
+        self.global_feats = global_feats
+        self.heads = heads
+
+        if global_feats:
+            self.global_feats_size = 8
+        else:
+            self.global_feats_size = 0
+
+        if concat_path:
+            self.concat_size = input_channels['path']
+        else:
+            self.concat_size = 0
+
+        self.convs = torch.nn.ModuleList()
+        self.readout = torch.nn.ModuleList()
+
+        # Message Passing
+        # first conv layer
+        self.convs.append(HeteroConv({
+            ('path', 'uses', 'link'): GATConv((-1, -1), node_embedding_size, heads=heads, concat=True),
+            ('link', 'includes', 'path'): GATConv((-1, -1), node_embedding_size, heads=heads, concat=True),
+            ('link', 'connects', 'node'): GATConv((-1, -1), node_embedding_size, heads=heads, concat=True),
+            ('node', 'has', 'link'): GATConv((-1, -1), node_embedding_size, heads=heads, concat=True)}, aggr='sum'))
+
+        # remaining conv layers
+        for _ in range(self.num_layers - 1):
+            self.convs.append(HeteroConv({
+                ('path', 'uses', 'link'): GATConv(node_embedding_size, node_embedding_size),
+                ('link', 'includes', 'path'): GATConv(node_embedding_size, node_embedding_size),
+                ('link', 'connects', 'node'): GATConv(node_embedding_size, node_embedding_size),
+                ('node', 'has', 'link'): GATConv(node_embedding_size, node_embedding_size)}, aggr='sum'))
+
+        # Readout Layer
+        act = eval(act)
+        for i in range(len(mlp_layers)):
+            if mlp_bn:
+                if i == 0:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size * heads + self.concat_size + self.global_feats_size, mlp_layers[i]),
+                                                            torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                            act
+                                                            ))
+                else:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
+                                                            torch.nn.BatchNorm1d(num_features=mlp_layers[i]),
+                                                            act
+                                                            ))
+
+            else:
+                if i == 0:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(node_embedding_size * heads + self.concat_size + self.global_feats_size, mlp_layers[i]),
+                                                            act
+                                                            ))
+
+                else:
+                    self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[i - 1], mlp_layers[i]),
+                                                            act
+                                                            ))
+
+        if mlp_head_act is None:
+            self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[-1], 1)))
+        else:
+            self.readout.append(torch.nn.Sequential(torch.nn.Linear(mlp_layers[-1], 1),
+                                                    eval(mlp_head_act)))
+
+    def forward(self, x_dict, edge_index_dict, path_batch):
+
+        origin_input = x_dict.copy()
+
+        if self.global_feats:
+            mean_global_feats = torch_geometric.nn.global_mean_pool(origin_input["path"], path_batch)
+            mean_global_max = torch_geometric.nn.global_max_pool(origin_input["path"], path_batch)
+
+            mean_global_feats = torch.gather(mean_global_feats, 0, path_batch.unsqueeze(1).repeat(1, mean_global_feats.shape[1]))
+            mean_global_max = torch.gather(mean_global_max, 0, path_batch.unsqueeze(1).repeat(1, mean_global_max.shape[1]))
+
+        # message passing
+        for i in range(self.num_layers):
+            x_dict = self.convs[i](x_dict, edge_index_dict)
+
+            for k, _ in x_dict.items():
+                x_dict[k] = torch.nn.functional.dropout(x_dict[k], p=self.dropout, training=self.training)
+
+        # readout
+        if self.concat_path:
+            if self.global_feats:
+                x = torch.cat((x_dict['path'], origin_input['path'], mean_global_feats, mean_global_max), 1)
+            else:
+                x = torch.cat((x_dict['path'], origin_input['path']), 1)
+        else:
+            if self.global_feats:
+                x = torch.cat((x_dict['path'], mean_global_feats, mean_global_max), 1)
+            else:
+                x = x_dict['path']
 
         for i in range(len(self.mlp_layers) + 1):
             x = self.readout[i](x)
@@ -874,13 +1008,15 @@ def train_one_epoch(epoch, loss_func, opt, dataloader, model, k=None):
             opt.zero_grad()
 
             # Get Model Output
-            out = model(sample.x_dict, sample.edge_index_dict)
+            out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
+            # print(out.shape)
 
             # Calculate loss and gradients
             label = sample['path'].y.reshape(-1, 1)
+            # print(label.shape)
             loss_value = loss_func(out, label)
 
-            loss = torch.sqrt(loss_value)
+            loss = loss_value #torch.sqrt(loss_value)
             loss.backward()
             opt.step()
 
@@ -923,7 +1059,7 @@ def test(epoch, loss_func, dataloader, model, mode, k=None):
         for sample in tqdm(dataloader):
             sample.cuda()
             with torch.set_grad_enabled(False):
-                out = model(sample.x_dict, sample.edge_index_dict)
+                out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
 
                 # Get label
                 label = sample['path'].y.reshape(-1, 1)
@@ -958,9 +1094,17 @@ def load_model(config, datasets):
     input_channels = {'link': datasets["train"][0]['link']['x'].shape[1],
                       'path': datasets["train"][0]['path']['x'].shape[1],
                       'node': datasets["train"][0]['node']['x'].shape[1]}
-    model = HetroGIN(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
-                     message_passing_layers=config['MP_LAYERS'], concat_path=config['CONCAT_PATH'], mlp_layers=config['MLP_LAYERS'],
-                     act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
+    if config['MODEL'] == "GAT":
+        model = HetroGAT(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
+                         message_passing_layers=config['MP_LAYERS'], dropout=config['DROPOUT'], heads=config['HEADS'], concat_path=config['CONCAT_PATH'], global_feats=config['GLOBAL_FEATS'], mlp_layers=config['MLP_LAYERS'],
+                         act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
+
+    elif config['MODEL'] == "GIN":
+        model = HetroGIN(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
+                         message_passing_layers=config['MP_LAYERS'], dropout=config['DROPOUT'], concat_path=config['CONCAT_PATH'], global_feats=config['GLOBAL_FEATS'], mlp_layers=config['MLP_LAYERS'],
+                         act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
+    else:
+        raise IOError("Model not implemented")
 
     return model
 
@@ -1035,7 +1179,84 @@ def train(config):
                 best_loss = loss
                 save_best_model(model, run)
 
-        return run.name
+        # evaluate best model
+        evaluate(config, run.name)
+
+
+def cross_validate(config):
+    K_FOLD = 10
+    with wandb.init(project=config['PROJECT_NAME'], entity="youssefshoeb", config=config):
+        # Access all hyperparameters through wandb.config, so logging matches execution
+        config = wandb.config
+
+        print("Loading Dataset...")
+        datasets, _ = initDataset(config)
+
+        # Hyperparameters
+        num_epochs = config["EPOCHS"]
+        loss_func = eval(config["LOSS"])
+
+        # k-fold cross validation scores and segment size
+        val_score = []
+
+        total_size = len(datasets['train'])
+        fraction = 1 / K_FOLD
+        seg = int(total_size * fraction)
+
+        for i in range(K_FOLD):
+            print(f"...Fold... {i + 1}")
+            print("Loading model...")
+            model = load_model(config, datasets)
+            model.cuda()
+
+            opt = load_optmizer(config, model)
+
+            # Dataset split
+            trll = 0
+            trlr = i * seg
+            vall = trlr
+            valr = i * seg + seg
+            trrl = valr
+            trrr = total_size
+
+            train_left_indices = list(range(trll, trlr))
+            train_right_indices = list(range(trrl, trrr))
+
+            train_indices = train_left_indices + train_right_indices
+            val_indices = list(range(vall, valr))
+
+            train_set = torch.utils.data.dataset.Subset(datasets['train'], train_indices)
+            val_set = torch.utils.data.dataset.Subset(datasets['train'], val_indices)
+
+            # Prepare training
+            train_loader = torch_geometric.loader.DataLoader(train_set, batch_size=config['TRAIN_BATCH_SIZE'], shuffle=True)
+            val_loader = torch_geometric.loader.DataLoader(val_set, batch_size=config['TRAIN_BATCH_SIZE'], shuffle=True)
+
+            # Start training
+            best_loss = np.inf
+            for epoch in range(num_epochs):
+                # Training
+                model.train()
+                train_one_epoch(epoch, loss_func, opt, train_loader, model, k=i + 1)
+
+                # Evaluation on validation set
+                model.eval()
+                loss = test(epoch, loss_func, val_loader, model, "Validation_1", k=i + 1)
+
+                # Update best loss
+                if loss < best_loss:
+                    best_loss = loss
+
+            # Record the best validation error
+            wandb.log({f"Best MAPE-validation": best_loss, "Fold": i + 1})
+            val_score.append(best_loss)
+            # free cache
+            torch.cuda.empty_cache()
+            del model
+
+        # Record the best validation error
+        wandb.log({f"Average Best MAPE-validation": float(np.mean(val_score)), "Epoch": 0})
+        print("Mean Val Loss", np.mean(val_score))
 
 
 def test_baseline():
@@ -1083,7 +1304,7 @@ def evaluate(config, filename):
 
     for _, sample in tqdm(enumerate(dataloaders['test']), total=len(dataloaders['test'])):
         with torch.set_grad_enabled(False):
-            out = model(sample.x_dict, sample.edge_index_dict)
+            out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
 
             # Get label
             label = sample['path'].y.reshape(-1, 1)
@@ -1096,7 +1317,7 @@ def evaluate(config, filename):
     average_loss = running_loss / step
 
     print('Test', average_loss)
-    # wandb.log({f"Test loss": float(average_loss), "Epoch": 0})
+    wandb.log({f"Test loss": float(average_loss), "Epoch": 0})
 
 
 """
@@ -1148,12 +1369,12 @@ if __name__ == "__main__":
     # test_baseline()
 
     # Train
-    run_name = train(json_config)
+    run_name = train(json_config)  # Remember to change project name in config
 
-    # Test Final Model
-    evaluate(json_config, run_name)  # TODO
+    # cross_validate(json_config)
 
     # Return dataset to one with baseline features
     if json_config['BL_FEATURES'] is False:
         json_config['BL_FEATURES'] = True
         preprocess_dataset(json_config)
+
