@@ -1,1112 +1,509 @@
-import urllib.request
-import tarfile
-import datanetAPI
 import os
 import torch
 import torch_geometric
-import tqdm
+import datanetAPI
+import re
+import math
+import csv
+
 import numpy as np
-import networkx as nx
+import pandas as pd
+import os.path as osp
+from tqdm import tqdm
+from models import QTBaseline
 
 
-def download_dataset(dataset_name, urls):
-    urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
-            'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
-            'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
+RAW_DIRS = {'train': './dataset/gnnet-ch21-dataset-train',
+            'validation': './dataset/gnnet-ch21-dataset-validation',
+            'test': './dataset/gnnet-ch21-dataset-test-with-labels'
+            }
 
-    os.makedirs(f'./data/{dataset_name}/', exist_ok=True)
-    os.makedirs(f'./data/{dataset_name}/raw', exist_ok=True)
-    os.makedirs(f'./data/{dataset_name}/processed', exist_ok=True)
+CONVERTED_DIRS = {'train': './dataset/converted_train',
+                  'validation': './dataset/converted_validation',
+                  'test': './dataset/converted_test'
+                  }
 
-    print("Downloading dataset...")
-    for k, v in urls.items():
-        urllib.request.urlretrieve(v, f'./data/{dataset_name}/raw/{k}.tar.gz')
+BATCH_SIZE = {'train':8,'val':1}
 
-    print("Extracting Tar-Files...")
-    for k, v in urls.items():
-        tar = tarfile.open(f'./data/{dataset_name}/raw/{k}.tar.gz')
-        tar.extractall(f'./data/{dataset_name}/raw')
-        tar.close()
-
-
-def generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle=False):
+class GNN21Dataset(torch_geometric.data.Dataset):
     """
-    This function uses the DatanetAPI to output a single sample of the data.
+    Convert pytorch Data objects to GNN input
     """
-    if dataset == "GNNCH21":
-        tool = datanetAPI.Datanet21API(
-            data_dir, intensity_values, topology_sizes, shuffle=shuffle)
-    elif dataset == "GNNCH20":
-        tool = datanetAPI.Datanet20API(
-            data_dir, intensity_values, shuffle=shuffle)
 
-    it = iter(tool)
-    num_samples = 0
+    def normalize(self, data):
+        data["link"].x[:, 0] = (
+            data["link"].x[:, 0] - 0.3546671) / 0.2083346
+        data["link"].x[:, 1] = (
+            data["link"].x[:, 1] - 0.16771736017268535) / 0.1974350417861857
+        data["link"].x[:, 2] = (
+            data["link"].x[:, 2] - 0.09862498490722958) / 0.179935315102362
+        data["link"].x[:, 3] = (
+            data["link"].x[:, 3] - 0.05104) / 0.06313
+        data["link"].x[:, 4] = (
+            data["link"].x[:, 4] - 0.35411) / 0.2075
+        data["link"].x[:, 5] = (
+            data["link"].x[:, 5] - 0.00066) / 0.00816
+        data["path"].x[:, 0] = (
+            data["path"].x[:, 0] - 0.6577772) / 0.4192159
+        data["path"].x[:, 1] = (
+            data["path"].x[:, 1] - 0.6578069) / 0.4192953
+        data["path"].x[:, 2] = (
+            data["path"].x[:, 2] - 0.6578076) / 0.4193256
+        data["path"].x[:, 3] = (
+            data["path"].x[:, 3] - 0.20152) / 0.18457
+
+        # data["path"].y = (
+        #    data["path"].y - 0) / (9.15503 - 0)
 
-    for sample in tqdm.tqdm(it):
-        G_copy = sample.get_topology_object().copy()
-        T = sample.get_traffic_matrix()
-        R = sample.get_routing_matrix()
-        D = sample.get_performance_matrix()
-        HG = input_to_networkx(network_graph=G_copy,
-                               routing_matrix=R,
-                               traffic_matrix=T,
-                               performance_matrix=D)
-        num_samples += 1
-        yield networkx_to_data(HG)
-
-
-def hetero_generator(data_dir, dataset, intensity_values=[], topology_sizes=[], shuffle=False):
-    """
-    This function uses the DatanetAPI to output a single sample of the data.
-    """
-    if dataset == "GNNCH21":
-        tool = datanetAPI.Datanet21API(
-            data_dir, intensity_values, topology_sizes, shuffle=shuffle)
-    elif dataset == "GNNCH20":
-        tool = datanetAPI.Datanet20API(
-            data_dir, intensity_values, shuffle=shuffle)
-
-    it = iter(tool)
-    num_samples = 0
-
-    for sample in tqdm.tqdm(it):
-        G_copy = sample.get_topology_object().copy()
-        T = sample.get_traffic_matrix()
-        R = sample.get_routing_matrix()
-        D = sample.get_performance_matrix()
-        HG = input_to_hetero_networkx(network_graph=G_copy,
-                                      routing_matrix=R,
-                                      traffic_matrix=T,
-                                      performance_matrix=D)
-        num_samples += 1
-        yield hetero_networkx_to_data(HG)
-
-
-def input_to_networkx(network_graph, routing_matrix, traffic_matrix, performance_matrix):
-    """
-    This function converts a dataset sample to a networkx line graph.
-    To be used for GNN-CH21 Dataset.
-    Uncomment lines to return back to more generic mode that allows for
-    saving all featurs (Warning: Extremly Slow)
-    """
-    G = nx.DiGraph(network_graph)
-    R = routing_matrix
-    T = traffic_matrix
-    D = performance_matrix
-
-    # Create a directed Networkx object
-    D_G = nx.DiGraph()
-
-    # Add all nodes to the graph
-    for src in range(G.number_of_nodes()):
-        D_G.add_node('n_{}'.format(src))
-
-    # Iterate over all nodes in the graph
-    for src in range(G.number_of_nodes()):
-        for dst in range(G.number_of_nodes()):
-            if src != dst:
-                # Add links to the graph as nodes
-                if G.has_edge(src, dst):
-                    # Add source node stats to link features
-                    # src_feats = dict((f'n_{k}', v)
-                    #                 for k, v in G.nodes[src].items())
-                    # link_feats = dict((f'n_{k}', v)
-                    #                 for k, v in G.edges[src, dst].items())
-                    link_feats = {'l_bandwidth': G.edges[src, dst]['bandwidth']}
-
-                    # if 'n_schedulingWeights' not in src_feats:
-                    #    src_feats.update({'n_schedulingWeights': '100,100,100'})
-
-                    # link_feats.update(src_feats)
-                    # For visualization
-                    # link_feats.update({'Type': 'link'})
-
-                    D_G.add_node('l_{}_{}'.format(src, dst), **link_feats)
-
-                    # Connect each link to its source and destination node
-                    D_G.add_edge('n_{}'.format(
-                        src), 'l_{}_{}'.format(src, dst))
-                    D_G.add_edge('l_{}_{}'.format(
-                        src, dst), 'n_{}'.format(dst))
-
-                # Add paths to the graph as nodes
-                for f_id in range(len(T[src, dst]['Flows'])):
-                    if T[src, dst]['Flows'][f_id]['AvgBw'] != 0 and T[src, dst]['Flows'][f_id]['PktsGen'] != 0:
-                        dct_flows = dict(
-                            (f'p_{k}', v) for k, v in T[src, dst]['Flows'][f_id].items())
-
-                        # For visualizeation remove enums
-                        dct_flows.pop('p_TimeDist')
-                        dct_flows.pop('p_SizeDist')
-                        dct_flows.update({'p_TimeDist': T[src, dst]['Flows'][f_id]['TimeDist'].name})
-                        dct_flows.update({'p_SizeDist': T[src, dst]['Flows'][f_id]['SizeDist'].name})
-                        # dct_flows.update({'Type': 'path'})
-                        # Flatten dict of dicts to just a dict
-                        dct_flows.pop('p_SizeDistParams')
-                        dct_flows.pop('p_TimeDistParams')
-                        dct_flows_size = dict(
-                            (f'p_size_{k}', v) for k, v in T[src, dst]['Flows'][f_id]['SizeDistParams'].items())
-                        dct_flows_time = dict(
-                            (f'p_time_{k}', v) for k, v in T[src, dst]['Flows'][f_id]['TimeDistParams'].items())
-                        dct_flows.update(dct_flows_size)
-                        dct_flows.update(dct_flows_time)
-                        dct_flows['p_AvgDelay'] = D[src,
-                                                    dst]['Flows'][f_id]['AvgDelay']
-
-                        # remove some features we already know have no effect
-                        dct_flows.pop('p_ToS')
-                        dct_flows.pop('p_time_ExpMaxFactor')
-                        dct_flows.pop('p_TimeDist')
-                        dct_flows.pop('p_SizeDist')
-                        dct_flows.pop('p_size_AvgPktSize')
-                        dct_flows.pop('p_size_PktSize1')
-                        dct_flows.pop('p_size_PktSize2')
-                        dct_flows.pop('p_TotalPktsGen')
-
-                        # divide features by p_time_AvgPktsLambda
-                        dct_flows['p_PktsGen*'] = dct_flows['p_PktsGen'] / \
-                            dct_flows['p_time_AvgPktsLambda']
-                        dct_flows['p_AvgBw*'] = dct_flows['p_AvgBw'] / \
-                            dct_flows['p_time_AvgPktsLambda']
-                        # dct_flows['p_time_EqLambda*'] = dct_flows['p_time_EqLambda'] / \
-                        #    dct_flows['p_time_AvgPktsLambda']
-
-                        dct_flows.pop('p_time_AvgPktsLambda')
-                        dct_flows.pop('p_PktsGen')
-
-                        D_G.add_node('p_{}_{}_{}'.format(
-                            src, dst, f_id), **dct_flows)
-
-                        # Add edges between paths and all links that traverse the path
-                        for _, (h_1, h_2) in enumerate([R[src, dst][i:i + 2] for i in range(0, len(R[src, dst]) - 1)]):
-                            _p = 'p_{}_{}_{}'.format(src, dst, f_id)
-                            _l = 'l_{}_{}'.format(h_1, h_2)
-                            D_G.add_edge(_p, _l)
-                            D_G.add_edge(_l, _p)
-
-    # Add edges between links connected by a node.
-    edge_list = list(D_G.edges())
-    for src, dst in edge_list:
-        if src.split('_')[0] == 'l':
-            for _, dst2 in D_G.out_edges(dst):
-                edge = (src, dst2)
-                if edge not in D_G.edges(src) and dst2 != src:
-                    D_G.add_edge(src, dst2)
-
-    # Remove nodes (Conversion to Line Graph)
-    for src in list(D_G.nodes):
-        if src.split('_')[0] == 'n':
-            D_G.remove_node(src)
-
-    # Add link_load feature to each link
-    link_loads = {}
-    for node in D_G.nodes():
-        if node.split('_')[0] == 'l':
-            load = 0
-            for src, _ in D_G.in_edges(node):
-                if src.split('_')[0] == 'p':
-                    load += D_G.nodes(data=True)[src]["p_AvgBw"]
-
-            load /= D_G.nodes(data=True)[node]["l_bandwidth"]
-            del D_G.nodes(data=True)[node]["l_bandwidth"]
-
-            link_loads[node] = {
-                "l_link_load": load, "l_link_load2": load * load, "l_link_load3": load * load * load}
-
-    nx.set_node_attributes(D_G, link_loads)
-
-    return D_G
-
-
-def input_to_hetero_networkx(network_graph, routing_matrix, traffic_matrix, performance_matrix):
-    """
-    This function converts a dataset sample to a networkx line graph.
-    To be used for GNN-CH21 Dataset.
-    Uncomment lines to return back to more generic mode that allows for
-    saving all featurs (Warning: Extremly Slow)
-    """
-    G = nx.DiGraph(network_graph)
-    R = routing_matrix
-    T = traffic_matrix
-    D = performance_matrix
-
-    # Create a directed Networkx object
-    D_G = nx.DiGraph()
-
-    # Add all nodes to the graph
-    for src in range(G.number_of_nodes()):
-        src_feats = {"node_feature_1": 1, "node_feature_2": 1, "node_feature_3": 1}
-        D_G.add_node('n_{}'.format(src), **src_feats)
-
-    # Iterate over all nodes in the graph
-    for src in range(G.number_of_nodes()):
-        for dst in range(G.number_of_nodes()):
-            if src != dst:
-                # Add links to the graph as nodes
-                if G.has_edge(src, dst):
-                    # Add source node stats to link features
-                    # src_feats = dict((f'n_{k}', v)
-                    #                 for k, v in G.nodes[src].items())
-                    # print(src_feats)
-                    # link_feats = dict((f'n_{k}', v)
-                    #                 for k, v in G.edges[src, dst].items())
-                    link_feats = {'l_bandwidth': G.edges[src, dst]['bandwidth']}
-
-                    # if 'n_schedulingWeights' not in src_feats:
-                    #    src_feats.update({'n_schedulingWeights': '100,100,100'})
-
-                    # link_feats.update(src_feats)
-                    # For visualization
-                    # link_feats.update({'Type': 'link'})
-
-                    D_G.add_node('l_{}_{}'.format(src, dst), **link_feats)
-
-                    # Connect each link to its source and destination node
-                    D_G.add_edge('n_{}'.format(
-                        src), 'l_{}_{}'.format(src, dst))
-                    D_G.add_edge('l_{}_{}'.format(
-                        src, dst), 'n_{}'.format(dst))
-
-                # Add paths to the graph as nodes
-                for f_id in range(len(T[src, dst]['Flows'])):
-                    if T[src, dst]['Flows'][f_id]['AvgBw'] != 0 and T[src, dst]['Flows'][f_id]['PktsGen'] != 0:
-                        dct_flows = dict(
-                            (f'p_{k}', v) for k, v in T[src, dst]['Flows'][f_id].items())
-
-                        # For visualizeation remove enums
-                        dct_flows.pop('p_TimeDist')
-                        dct_flows.pop('p_SizeDist')
-                        dct_flows.update({'p_TimeDist': T[src, dst]['Flows'][f_id]['TimeDist'].name})
-                        dct_flows.update({'p_SizeDist': T[src, dst]['Flows'][f_id]['SizeDist'].name})
-                        # dct_flows.update({'Type': 'path'})
-                        # Flatten dict of dicts to just a dict
-                        dct_flows.pop('p_SizeDistParams')
-                        dct_flows.pop('p_TimeDistParams')
-                        dct_flows_size = dict(
-                            (f'p_size_{k}', v) for k, v in T[src, dst]['Flows'][f_id]['SizeDistParams'].items())
-                        dct_flows_time = dict(
-                            (f'p_time_{k}', v) for k, v in T[src, dst]['Flows'][f_id]['TimeDistParams'].items())
-                        dct_flows.update(dct_flows_size)
-                        dct_flows.update(dct_flows_time)
-                        dct_flows['p_AvgDelay'] = D[src,
-                                                    dst]['Flows'][f_id]['AvgDelay']
-
-                        # remove some features we already know have no effect
-                        dct_flows.pop('p_ToS')
-                        dct_flows.pop('p_time_ExpMaxFactor')
-                        dct_flows.pop('p_TimeDist')
-                        dct_flows.pop('p_SizeDist')
-                        dct_flows.pop('p_size_AvgPktSize')
-                        dct_flows.pop('p_size_PktSize1')
-                        dct_flows.pop('p_size_PktSize2')
-                        dct_flows.pop('p_TotalPktsGen')
-
-                        # divide features by p_time_AvgPktsLambda
-                        dct_flows['p_PktsGen*'] = dct_flows['p_PktsGen'] / \
-                            dct_flows['p_time_AvgPktsLambda']
-                        dct_flows['p_AvgBw*'] = dct_flows['p_AvgBw'] / \
-                            dct_flows['p_time_AvgPktsLambda']
-                        # dct_flows['p_time_EqLambda*'] = dct_flows['p_time_EqLambda'] / \
-                        #    dct_flows['p_time_AvgPktsLambda']
-
-                        dct_flows.pop('p_time_AvgPktsLambda')
-                        dct_flows.pop('p_PktsGen')
-
-                        D_G.add_node('p_{}_{}_{}'.format(
-                            src, dst, f_id), **dct_flows)
-
-                        # Add edges between paths and all links that traverse the path
-                        for _, (h_1, h_2) in enumerate([R[src, dst][i:i + 2] for i in range(0, len(R[src, dst]) - 1)]):
-                            _p = 'p_{}_{}_{}'.format(src, dst, f_id)
-                            _l = 'l_{}_{}'.format(h_1, h_2)
-                            _n1 = 'n_{}'.format(h_1)
-                            _n2 = 'n_{}'.format(h_2)
-
-                            # if _n1 not in D_G[_p]:
-                            #    D_G.add_edge(_p, _n1)
-                            #    D_G.add_edge(_n1, _p)
-
-                            # if _n2 not in D_G[_p]:
-                            #    D_G.add_edge(_p, _n2)
-                            #    D_G.add_edge(_n1, _p)
-
-                            D_G.add_edge(_p, _l)
-                            D_G.add_edge(_l, _p)
-
-    # Add edges between links connected by a node.
-    # edge_list = list(D_G.edges())
-    # for src, dst in edge_list:
-    #    if src.split('_')[0] == 'l':
-    #        for _, dst2 in D_G.out_edges(dst):
-    #            edge = (src, dst2)
-    #            if edge not in D_G.edges(src) and dst2 != src:
-    #                D_G.add_edge(src, dst2)
-
-    # Remove nodes (Conversion to Line Graph)
-    # for src in list(D_G.nodes):
-    #    if src.split('_')[0] == 'n':
-    #        D_G.remove_node(src)
-
-    # Add link_load feature to each link
-    link_loads = {}
-    for node in D_G.nodes():
-        if node.split('_')[0] == 'l':
-            load = 0
-            for src, _ in D_G.in_edges(node):
-                if src.split('_')[0] == 'p':
-                    load += D_G.nodes(data=True)[src]["p_AvgBw"]
-
-            load /= D_G.nodes(data=True)[node]["l_bandwidth"]
-            del D_G.nodes(data=True)[node]["l_bandwidth"]
-
-            link_loads[node] = {
-                "l_link_load": load, "l_link_load2": load * load, "l_link_load3": load * load * load}
-
-    nx.set_node_attributes(D_G, link_loads)
-
-    return D_G
-
-
-def networkx_to_data(G):
-    """
-    Convert the networkx line graph to a feature matrix and edge index.
-    We save the path and link index to correctly get the edge indicies
-    """
-    feature_dict = {}
-    key_dict = {}
-    paths_i = 0
-    links_i = 0
-
-    # Get Path and Link features
-    for _, (key, feat_dict) in enumerate(G.nodes(data=True)):
-        if key.split('_')[0] == 'p':
-            key_dict[key] = paths_i
-
-            if paths_i == 0:
-                feature_dict["paths"] = dict(
-                    (k, np.array([])) for k, _ in feat_dict.items())
-
-            path_features = dict((k, v) for k, v in feat_dict.items())
-
-            for k, v in feature_dict["paths"].items():
-                feature_dict["paths"][k] = np.append([v], [path_features[k]])
-
-            paths_i += 1
-
-        elif key.split('_')[0] == 'l':
-            key_dict[key] = links_i
-
-            if links_i == 0:
-                feature_dict["links"] = dict(
-                    (k, np.array([])) for k, _ in feat_dict.items())
-
-            link_features = dict((k, v) for k, v in feat_dict.items())
-
-            for k, v in feature_dict["links"].items():
-                feature_dict["links"][k] = np.append([v], [link_features[k]])
-
-            links_i += 1
-
-    # Get edges index
-    edge_dict = {"p-l": [], "l-p": [], "l-l": []}
-    for edge in G.edges:
-        if edge[0].split("_")[0] == 'p' and edge[1].split("_")[0] == 'l':
-            edge_dict["p-l"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-        elif edge[0].split("_")[0] == 'l' and edge[1].split("_")[0] == 'p':
-            edge_dict["l-p"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-        elif edge[0].split("_")[0] == 'l' and edge[1].split("_")[0] == 'l':
-            edge_dict["l-l"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-    edge_dict["p-l"] = torch.tensor(edge_dict["p-l"]).t().contiguous()
-    edge_dict["l-p"] = torch.tensor(edge_dict["l-p"]).t().contiguous()
-    edge_dict["l-l"] = torch.tensor(edge_dict["l-l"]).t().contiguous()
-
-    return feature_dict, edge_dict
-
-
-def hetero_networkx_to_data(G):
-    """
-    Convert the networkx graph to a feature matrix and edge index.
-    We save the path and link index to correctly get the edge indicies
-    """
-    feature_dict = {}
-    key_dict = {}
-    paths_i = 0
-    links_i = 0
-    nodes_i = 0
-
-    # Get Path and Link features
-    for _, (key, feat_dict) in enumerate(G.nodes(data=True)):
-        if key.split('_')[0] == 'p':
-            key_dict[key] = paths_i
-
-            if paths_i == 0:
-                feature_dict["paths"] = dict(
-                    (k, np.array([])) for k, _ in feat_dict.items())
-
-            path_features = dict((k, v) for k, v in feat_dict.items())
-
-            for k, v in feature_dict["paths"].items():
-                feature_dict["paths"][k] = np.append([v], [path_features[k]])
-
-            paths_i += 1
-
-        elif key.split('_')[0] == 'l':
-            key_dict[key] = links_i
-
-            if links_i == 0:
-                feature_dict["links"] = dict(
-                    (k, np.array([])) for k, _ in feat_dict.items())
-
-            link_features = dict((k, v) for k, v in feat_dict.items())
-
-            for k, v in feature_dict["links"].items():
-                feature_dict["links"][k] = np.append([v], [link_features[k]])
-
-            links_i += 1
-
-        elif key.split('_')[0] == 'n':
-            key_dict[key] = nodes_i
-
-            if nodes_i == 0:
-                feature_dict["nodes"] = dict(
-                    (k, np.array([])) for k, _ in feat_dict.items())
-
-            node_features = dict((k, v) for k, v in feat_dict.items())
-
-            for k, v in feature_dict["nodes"].items():
-                feature_dict["nodes"][k] = np.append([v], [node_features[k]])
-
-            nodes_i += 1
-
-    # Get edges index
-    edge_dict = {"p-l": [], "l-p": [], "l-n": [], "n-l": []}
-    for edge in G.edges:
-        if edge[0].split("_")[0] == 'p' and edge[1].split("_")[0] == 'l':
-            edge_dict["p-l"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-        elif edge[0].split("_")[0] == 'l' and edge[1].split("_")[0] == 'p':
-            edge_dict["l-p"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-        elif edge[0].split("_")[0] == 'l' and edge[1].split("_")[0] == 'n':
-            edge_dict["l-n"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-        elif edge[0].split("_")[0] == 'n' and edge[1].split("_")[0] == 'l':
-            edge_dict["n-l"].append([key_dict[edge[0]], key_dict[edge[1]]])
-
-    edge_dict["p-l"] = torch.tensor(edge_dict["p-l"]).t().contiguous()
-    edge_dict["l-p"] = torch.tensor(edge_dict["l-p"]).t().contiguous()
-    edge_dict["l-n"] = torch.tensor(edge_dict["l-n"]).t().contiguous()
-    edge_dict["n-l"] = torch.tensor(edge_dict["n-l"]).t().contiguous()
-
-    return feature_dict, edge_dict
-
-
-class TorchDataset(torch.utils.data.IterableDataset):
-    def __init__(self, filename, dataset_name, intensity=[], topology_sizes=[], shuffle=False):
-        'Initialization'
-        self.generator_object = generator(
-            filename, dataset_name, intensity, topology_sizes, shuffle=shuffle)
-
-    def __iter__(self):
-        'Generates one sample of data'
-        return iter(self.generator_object)
-
-
-class HETROTorchDataset(torch.utils.data.IterableDataset):
-    def __init__(self, filename, dataset_name, intensity=[], topology_sizes=[], shuffle=False):
-        'Initialization'
-        self.generator_object = hetero_generator(
-            filename, dataset_name, intensity, topology_sizes, shuffle=shuffle)
-
-    def __iter__(self):
-        'Generates one sample of data'
-        return iter(self.generator_object)
-
-
-class GNNC21Dataset(torch_geometric.data.Dataset):
-    def __init__(self, root, filename, val=False, test=False, transform=None, pre_transform=None):
-        """
-        root = Where the dataset should be stored. This folder is split
-        into raw_dir (downloaded dataset) and processed_dir (processed data).
-        """
-        self.test = test
-        self.val = val
-        self.filename = filename
-        self.dataset_name = "GNNCH21"
-        self.processed_dataset_name = 'gnnet-ch21-dataset-train'
-
-        self.urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
-                     'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
-                     'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
-
-        super(GNNC21Dataset, self).__init__(root, transform, pre_transform)
-
-    @property
-    def raw_file_names(self):
-        """ If this file exists in raw_dir, the download is not triggered.
-            (The download func. is not implemented here)
-        """
-        # Add the name of the dataset gnnet_data_set_training
-        return [self.processed_dataset_name]
-
-    @property
-    def processed_file_names(self):
-        """ If these files are found in raw_dir, processing is skipped"""
-
-        if self.test:
-            return [f'data_test_{i}.pt' for i in range(20)]
-        elif self.val:
-            return [f'data_val_{i}.pt' for i in range(20)]
-        else:
-            return [f'data_{i}.pt' for i in range(20)]
-
-    def transformation(self, x):
-        """Apply a transformation over all the samples included in the dataset.
-            Args:
-                x (dict): predictor variable.
-            Returns:
-                x,y: The modified predictor/target variables.
-            """
-        x["links"]['l_link_load'] = (
-            x["links"]['l_link_load'] - 0.0) / (1.9705873632629973 - 0.0)
-        x["links"]['l_link_load2'] = (
-            x["links"]['l_link_load2']) / (3.8832145562518123 - 0.0)
-        x["links"]['l_link_load3'] = (
-            x["links"]['l_link_load3']) / (7.652213533388749 - 0.0)
-        x["paths"]['p_PktsGen*'] = (
-            x["paths"]['p_PktsGen*'] - 0.7498462848223999) / (1.3038396633263194 - 0.7498462848223999)
-        x["paths"]['p_AvgBw*'] = (
-            x["paths"]['p_AvgBw*'] - 622.2114877920252) / (1346.7849033971643 - 622.2114877920252)
-        x["paths"]['p_time_EqLambda'] = (
-            x["paths"]['p_time_EqLambda'] - 40.0337) / (1999.52 - 40.0337)
-        x["paths"]['p_AvgDelay'] = (
-            x["paths"]['p_AvgDelay'] - 0.000418) / (9.15503 - 0.000418)
-
-        return x
-
-    def download(self):
-        raise download_dataset(self.dataset_name, self.urls)
-
-    def process(self):
-        dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
-        index = 0
-
-        for feature_dict, edge_dict in dataset:
-            feature_dict = self.transformation(feature_dict)
-
-            # Create data object
-            data = torch_geometric.data.HeteroData()
-
-            # Get node features and labels
-            data['link'].x = self._get_link_features(
-                feature_dict)  # [num_link, num_features_link]
-            data['path'].x = self._get_path_features(
-                feature_dict)  # [num_path, num_features_path]
-
-            # Get adjacency info
-            data['path', 'uses', 'link'].edge_index = edge_dict['p-l']
-            data['link', 'includes', 'path'].edge_index = edge_dict['l-p']
-            data['link', 'connects', 'link'].edge_index = edge_dict['l-l']
-
-            # Label
-            data['path'].y = self._get_label(feature_dict)
-
-            if self.test:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_test_{index}.pt'))
-            elif self.val:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_val_{index}.pt'))
-            else:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_{index}.pt'))
-            index += 1
-
-    def _get_link_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of links, link Feature size]
-        """
-        """
-        Features ignored: 'l_bandwidth'
-        """
-        n_links = len(features["links"][next(iter(features["links"]))])
-        num_link_features = 3
-        link_features = torch.zeros((n_links, num_link_features))
-
-        for i in range(n_links):
-            link_features[i][0] = features["links"]['l_link_load'][i]
-            link_features[i][1] = features["links"]['l_link_load2'][i]
-            link_features[i][2] = features["links"]['l_link_load3'][i]
-
-        return link_features
-
-    def _get_path_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of paths, Path feature size]
-        """
-        """
-        Features ignored: 'p_ToS', 'p_time_ExpMaxFactor', 'p_TimeDist', 'p_SizeDist',
-        'p_size_AvgPktSize', 'p_size_PktSize1', 'p_size_PktSize2', 'p_TotalPktsGen',
-        'p_time_AvgPktsLambda
-        """
-        n_paths = len(features["paths"][next(iter(features["paths"]))])
-        num_path_features = 3
-        path_features = torch.zeros((n_paths, num_path_features))
-
-        for i in range(n_paths):
-            path_features[i][0] = features['paths']['p_AvgBw*'][i]
-            path_features[i][1] = features['paths']['p_PktsGen*'][i]
-            path_features[i][2] = features['paths']['p_time_EqLambda'][i]
-
-        return path_features
-
-    def _get_label(self, features):
-        return features["paths"]['p_AvgDelay']
-
-    def len(self):
-        if self.test:
-            return 1_560
-        elif self.val:
-            return 3_120
-        return 120_000
-
-    def get(self, idx):
-        """ - Equivalent to __getitem__ in pytorch
-            - Is not needed for PyG's InMemoryDataset
-        """
-        if self.test:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_test_{idx}.pt'))
-        elif self.val:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_val_{idx}.pt'))
-        else:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_{idx}.pt'))
         return data
 
+    def preprocess(self, data, converted_path):
+        # Remove features that have same value across different nodes/simulations
+        del data.p_SizeDist, data.p_TimeDist, data.p_ToS, data.p_time_ExpMaxFactor, data.p_TotalPktsGen, data.EqLambda, data.PktSize2, data.PktSize1, data.AvgPktSize
+        del data.n_queueSizes, data.n_levelsQoS, data.n_schedulingPolicy
 
-class HETROGNNC21Dataset(torch_geometric.data.Dataset):
-    def __init__(self, root, filename, val=False, test=False, transform=None, pre_transform=None):
-        """
-        root = Where the dataset should be stored. This folder is split
-        into raw_dir (downloaded dataset) and processed_dir (processed data).
-        """
-        self.test = test
-        self.val = val
-        self.filename = filename
-        self.dataset_name = "GNNCH21"
-        self.processed_dataset_name = 'gnnet-ch21-dataset-train'
+        # Path Attributes
+        timeparams = [f'p_time_{a}' for a in ['AvgPktsLambda']]
 
-        self.urls = {'train': "https://bnn.upc.edu/download/ch21-training-dataset",
-                     'val': "https://bnn.upc.edu/download/ch21-validation-dataset",
-                     'test': "https://bnn.upc.edu/download/ch21-test-dataset-with-labels"}
+        p_params = timeparams + ['p_PktsGen', 'p_AvgBw']
 
-        super(HETROGNNC21Dataset, self).__init__(root, transform, pre_transform)
+        data.p_AvgBw /= 1000.0
 
-    @property
-    def raw_file_names(self):
-        """ If this file exists in raw_dir, the download is not triggered.
-            (The download func. is not implemented here)
-        """
-        # Add the name of the dataset gnnet_data_set_training
-        return [self.processed_dataset_name]
+        data.P = torch.cat([getattr(data, a).view(-1, 1) for a in p_params], axis=1)
 
-    @property
-    def processed_file_names(self):
-        """ If these files are found in raw_dir, processing is skipped"""
+        mean_pkts_rate = data.p_time_AvgPktsLambda.mean().item()
 
-        if self.test:
-            return [f'data_test_{i}.pt' for i in range(20)]
-        elif self.val:
-            return [f'data_val_{i}.pt' for i in range(20)]
+        #  Global Attributes
+        global_attrs = ['g_delay', 'g_packets', 'g_losses', 'g_AvgPktsLambda']
+
+        for a in global_attrs:
+            delattr(data, a)
+
+        # Link attributes
+        data.L = data.l_capacity.clone().view(-1, 1)
+
+        # Get baseline features
+        b_out, b_occup = self.baseline(data)
+
+        # Create data object
+        torch_data = torch_geometric.data.HeteroData()
+        l_params = ['l_link_load', 'l_link_load2', 'l_link_load3']
+        torch_data['link'].x = torch.cat([getattr(data, a).view(-1, 1) for a in l_params], axis=1)
+        torch_data['link'].x = torch.cat([torch_data['link'].x,data.L/(mean_pkts_rate*10000)], axis=1) # link_capacity*
+
+
+        p_params = ['p_time_AvgPktsLambda', 'p_PktsGen', 'p_AvgBw']
+        torch_data['path'].x = torch.cat([getattr(data, a).view(-1, 1) for a in p_params], axis=1)
+        torch_data['path'].x = torch.cat([torch_data['path'].x, torch_data['path'].x[:,0].view(-1,1) /mean_pkts_rate], axis=1) # p_time_AvgPktsLambda*
+        torch_data['path'].x = torch.cat([torch_data['path'].x, torch_data['path'].x[:,1].view(-1,1) /mean_pkts_rate], axis=1)  # p_PktsGen*
+        torch_data['path'].x = torch.cat([torch_data['path'].x, torch_data['path'].x[:,2].view(-1,1) /mean_pkts_rate], axis=1)  # p_AvgBw*
+
+        num_node_nodes = (data.num_nodes - int(torch_data['path'].x.shape[0]) - int(torch_data['link'].x.shape[0]))
+        torch_data['node'].x = torch.ones((num_node_nodes, 3))
+
+        
+        torch_data['link'].x = torch.cat([torch_data['link'].x, b_occup], axis=1)  # add baseline link features
+        torch_data['path'].x = torch.cat([torch_data['path'].x, b_out.reshape((-1, 1))], axis=1)  # add baseline path feature
+
+        # Label
+        torch_data['path'].y = data['out_delay']
+
+        # Get adjacency info
+        torch_data['path', 'uses', 'link'].edge_index = data['p-l']
+        torch_data['link', 'includes', 'path'].edge_index = data['l-p']
+        torch_data['link', 'connects', 'node'].edge_index = data['l-n']
+        torch_data['node', 'has', 'link'].edge_index = data['n-l']
+        torch_data['path', 'is_connected', 'node'].edge_index = data['p-n']
+        torch_data['node', 'is_used', 'path'].edge_index = data['n-p']
+
+        # torch_data = self.normalize(torch_data)
+        if converted_path is not None:
+            torch.save(torch_data, converted_path)
+
+        return torch_data
+
+    def __init__(self, root_dir, convert_files, normalize=None, filenames=None):
+        self.root_dir = root_dir
+        self.convert_files = convert_files
+
+        self.baseline = QTBaseline()
+
+        if filenames is None:
+            onlyfiles = [f for f in os.listdir(self.root_dir) if osp.isfile(osp.join(self.root_dir, f))]
+            self.filenames = [f for f in onlyfiles if f.endswith('.pt')]
         else:
-            return [f'data_{i}.pt' for i in range(20)]
+            self.filenames = filenames
 
-    def transformation(self, x):
-        """Apply a transformation over all the samples included in the dataset.
-            Args:
-                x (dict): predictor variable.
-            Returns:
-                x,y: The modified predictor/target variables.
-            """
-        x["links"]['l_link_load'] = (
-            x["links"]['l_link_load'] - 0.0) / (1.9705873632629973 - 0.0)
-        x["links"]['l_link_load2'] = (
-            x["links"]['l_link_load2']) / (3.8832145562518123 - 0.0)
-        x["links"]['l_link_load3'] = (
-            x["links"]['l_link_load3']) / (7.652213533388749 - 0.0)
-        x["paths"]['p_PktsGen*'] = (
-            x["paths"]['p_PktsGen*'] - 0.7498462848223999) / (1.3038396633263194 - 0.7498462848223999)
-        x["paths"]['p_AvgBw*'] = (
-            x["paths"]['p_AvgBw*'] - 622.2114877920252) / (1346.7849033971643 - 622.2114877920252)
-        x["paths"]['p_time_EqLambda'] = (
-            x["paths"]['p_time_EqLambda'] - 40.0337) / (1999.52 - 40.0337)
-        x["paths"]['p_AvgDelay'] = (
-            x["paths"]['p_AvgDelay'] - 0.000418) / (9.15503 - 0.000418)
-
-        return x
-
-    def download(self):
-        download_dataset(self.dataset_name, self.urls)
-
-    def process(self):
-        dataset = HETROTorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
-        index = 0
-
-        for feature_dict, edge_dict in dataset:
-            feature_dict = self.transformation(feature_dict)
-
-            # Create data object
-            data = torch_geometric.data.HeteroData()
-
-            # Get node features and labels
-            data['node'].x = self._get_node_features(
-                feature_dict)  # [num_link, num_features_link]
-            data['link'].x = self._get_link_features(
-                feature_dict)  # [num_link, num_features_link]
-            data['path'].x = self._get_path_features(
-                feature_dict)  # [num_path, num_features_path]
-
-            # Get adjacency info
-            data['path', 'uses', 'link'].edge_index = edge_dict['p-l']
-            data['link', 'includes', 'path'].edge_index = edge_dict['l-p']
-            data['link', 'connects', 'node'].edge_index = edge_dict['l-n']
-            data['node', 'has', 'link'].edge_index = edge_dict['n-l']
-            # data['node', 'is_included', 'path'].edge_index = edge_dict['n-p']
-            # data['path', 'connects', 'node'].edge_index = edge_dict['p-n']
-
-            # Label
-            data['path'].y = self._get_label(feature_dict)
-
-            if self.test:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_test_{index}.pt'))
-            elif self.val:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_val_{index}.pt'))
-            else:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_{index}.pt'))
-            index += 1
-
-    def _get_link_features(self, features):
+    def __len__(self):
         """
-        This will return a matrix / 2d array of the shape
-        [Number of links, link Feature size]
-        """
-        """
-        Features ignored: 'l_bandwidth'
-        """
-        n_links = len(features["links"][next(iter(features["links"]))])
-        num_link_features = 3
-        link_features = torch.zeros((n_links, num_link_features))
-
-        for i in range(n_links):
-            link_features[i][0] = features["links"]['l_link_load'][i]
-            link_features[i][1] = features["links"]['l_link_load2'][i]
-            link_features[i][2] = features["links"]['l_link_load3'][i]
-
-        return link_features
-
-    def _get_path_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of paths, Path feature size]
-        """
-        """
-        Features ignored: 'p_ToS', 'p_time_ExpMaxFactor', 'p_TimeDist', 'p_SizeDist',
-        'p_size_AvgPktSize', 'p_size_PktSize1', 'p_size_PktSize2', 'p_TotalPktsGen',
-        'p_time_AvgPktsLambda
-        """
-        n_paths = len(features["paths"][next(iter(features["paths"]))])
-        num_path_features = 3
-        path_features = torch.zeros((n_paths, num_path_features))
-
-        for i in range(n_paths):
-            path_features[i][0] = features['paths']['p_AvgBw*'][i]
-            path_features[i][1] = features['paths']['p_PktsGen*'][i]
-            path_features[i][2] = features['paths']['p_time_EqLambda'][i]
-
-        return path_features
-
-    def _get_node_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of paths, Path feature size]
-        """
-        n_paths = len(features["nodes"][next(iter(features["nodes"]))])
-        num_path_features = 3
-        node_features = torch.zeros((n_paths, num_path_features))
-
-        for i in range(n_paths):
-            node_features[i][0] = features['nodes']['node_feature_1'][i]
-            node_features[i][1] = features['nodes']['node_feature_2'][i]
-            node_features[i][2] = features['nodes']['node_feature_3'][i]
-
-        return node_features
-
-    def _get_label(self, features):
-        return features["paths"]['p_AvgDelay']
-
-    def len(self):
-        if self.test:
-            return 1_560
-        elif self.val:
-            return 3_120
-        return 120_000
-
-    def get(self, idx):
-        """ - Equivalent to __getitem__ in pytorch
-            - Is not needed for PyG's InMemoryDataset
-        """
-        if self.test:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_test_{idx}.pt'))
-        elif self.val:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_val_{idx}.pt'))
+        if self.root_dir == CONVERTED_DIRS['train']:
+            return 1000 # len(self.filenames)
         else:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_{idx}.pt'))
-        return data
-
-
-class GNNC20Dataset(torch_geometric.data.Dataset):
-    def __init__(self, root, filename, val=False, test=False, transform=None, pre_transform=None):
+            return len(self.filenames)
         """
-        root = Where the dataset should be stored. This folder is split
-        into raw_dir (downloaded dataset) and processed_dir (processed data).
-        """
-        self.test = test
-        self.val = val
-        self.filename = filename
-        self.dataset_name = "GNNCH20"
-        self.urls = {'train': "https://bnn.upc.edu/download/ch20-training-dataset/",
-                     'val': "https://bnn.upc.edu/download/ch20-validation-dataset/",
-                     'test': "https://bnn.upc.edu/download/ch20-test-complete-dataset/"}
+        return len(self.filenames)
 
-        super(GNNC20Dataset, self).__init__(root, transform, pre_transform)
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
 
-    @property
-    def raw_file_names(self):
-        """ If this file exists in raw_dir, the download is not triggered.
-            (The download func. is not implemented here)
-        """
-        # Add the name of the dataset gnnet_data_set_training
-        return ['gnnet_data_set_training']
+        filename = self.filenames[idx]
+        pt_path = osp.join(self.root_dir, filename)
 
-    @property
-    def processed_file_names(self):
-        """ If these files are found in raw_dir, processing is skipped"""
+        converted_dir = self.root_dir + '_processed'
+        os.makedirs(converted_dir, exist_ok=True)
 
-        if self.test:
-            return [f'data_test_{i}.pt' for i in range(20)]
-        elif self.val:
-            return [f'data_val_{i}.pt' for i in range(20)]
+        converted_path = osp.join(converted_dir, filename)
+
+        # if convert_files is False then load saved processed file to save time
+        if self.convert_files:
+            sample = torch.load(pt_path, map_location='cpu')
+            sample = self.preprocess(sample, converted_path=converted_path)
         else:
-            return [f'data_{i}.pt' for i in range(20)]
+            sample = torch.load(converted_path, map_location='cpu')
 
-    def transformation(self, x):
-        """Apply a transformation over all the samples included in the dataset.
-            Args:
-                x (dict): predictor variable.
-            Returns:
-                x,y: The modified predictor/target variables.
-            """
-        x["links"]['l_link_load'] = (
-            x["links"]['l_link_load'] - 0.0) / (4.203 - 0.001)
-        x["links"]['l_link_load2'] = (
-            x["links"]['l_link_load2']) / (17.663 - 0.0)
-        x["links"]['l_link_load3'] = (
-            x["links"]['l_link_load3']) / (74.234 - 0.0)
-        x["paths"]['p_PktsGen*'] = (
-            x["paths"]['p_PktsGen*'] - 0.899) / (1.102 - 0.899)
-        x["paths"]['p_AvgBw*'] = (
-            x["paths"]['p_AvgBw*'] - 881.034) / (1134.054 - 881.034)
-        x["paths"]['p_time_EqLambda'] = (
-            x["paths"]['p_time_EqLambda'] - 40.0237) / (1999.63 - 40.0237)
-        x["paths"]['p_AvgDelay'] = (
-            x["paths"]['p_AvgDelay'] - 0.0075) / (246006.0 - 0.0075)
-
-        schedulingweights = [y.split(',') for y in x["links"]['n_schedulingWeights']]
-        x["links"]['n_schedulingWeights'] = [f'{float(elem[0])/100},{float(elem[1])/100},{float(elem[2])/100}' for elem in schedulingweights]
-
-        return x
-
-    def download(self):
-        raise download_dataset(self.dataset_name, self.urls)
-
-    def process(self):
-        dataset = TorchDataset(os.path.join(self.raw_dir, self.filename), self.dataset_name)
-        index = 0
-
-        for feature_dict, edge_dict in dataset:
-            feature_dict = self.transformation(feature_dict)
-
-            # Create data object
-            data = torch_geometric.data.HeteroData()
-
-            # Get node features and labels
-            data['link'].x = self._get_link_features(
-                feature_dict)  # [num_link, num_features_link]
-            data['path'].x = self._get_path_features(
-                feature_dict)  # [num_path, num_features_path]
-
-            # Get adjacency info
-            data['path', 'uses', 'link'].edge_index = edge_dict['p-l']
-            data['link', 'includes', 'path'].edge_index = edge_dict['l-p']
-            data['link', 'connects', 'link'].edge_index = edge_dict['l-l']
-
-            # Label
-            data['path'].y = self._get_label(feature_dict)
-
-            if self.test:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_test_{index}.pt'))
-            elif self.val:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_val_{index}.pt'))
-            else:
-                torch.save(data, os.path.join(
-                    self.processed_dir, f'data_{index}.pt'))
-            index += 1
-
-    def _get_link_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of links, link Feature size]
-        """
-        """
-        Features ignored: 'l_bandwidth'
-        """
-        n_links = len(features["links"][next(iter(features["links"]))])
-        num_link_features = 9
-        link_features = torch.zeros((n_links, num_link_features))
-
-        for i in range(n_links):
-            link_features[i][0] = features["links"]['l_link_load'][i]
-            link_features[i][1] = features["links"]['l_link_load2'][i]
-            link_features[i][2] = features["links"]['l_link_load3'][i]
-            policy = features["links"]['n_schedulingPolicy'][i]
-            if policy == "WFQ":
-                link_features[i][3] = 1
-                link_features[i][4] = 0
-                link_features[i][5] = 0
-            elif policy == "SP":
-                link_features[i][3] = 0
-                link_features[i][4] = 1
-                link_features[i][5] = 0
-            elif policy == "DRR":
-                link_features[i][3] = 0
-                link_features[i][4] = 0
-                link_features[i][5] = 1
-            weights = features["links"]['n_schedulingWeights'][i].split(',')
-            link_features[i][6] = float(weights[0])
-            link_features[i][7] = float(weights[1])
-            link_features[i][8] = float(weights[2])
-
-        return link_features
-
-    def _get_path_features(self, features):
-        """
-        This will return a matrix / 2d array of the shape
-        [Number of paths, Path feature size]
-        """
-        """
-        Features ignored: 'p_ToS', 'p_time_ExpMaxFactor', 'p_TimeDist', 'p_SizeDist',
-        'p_size_AvgPktSize', 'p_size_PktSize1', 'p_size_PktSize2', 'p_TotalPktsGen',
-        'p_time_AvgPktsLambda
-        """
-        n_paths = len(features["paths"][next(iter(features["paths"]))])
-        num_path_features = 6
-        path_features = torch.zeros((n_paths, num_path_features))
-
-        for i in range(n_paths):
-            path_features[i][0] = features['paths']['p_AvgBw*'][i]
-            path_features[i][1] = features['paths']['p_PktsGen*'][i]
-            path_features[i][2] = features['paths']['p_time_EqLambda'][i]
-            tos = features['paths']['p_ToS'][i]
-            if tos == 0:
-                path_features[i][3] = 1
-                path_features[i][4] = 0
-                path_features[i][5] = 0
-            elif tos == 1:
-                path_features[i][3] = 0
-                path_features[i][4] = 1
-                path_features[i][5] = 0
-            elif tos == 2:
-                path_features[i][3] = 0
-                path_features[i][4] = 0
-                path_features[i][5] = 1
-
-        return path_features
-
-    def _get_label(self, features):
-        return features["paths"]['p_AvgDelay']
-
-    def len(self):
-        if self.test:
-            return 50_000
-        elif self.val:
-            return 100_000
-        return 400_000
-
-    def get(self, idx):
-        """ - Equivalent to __getitem__ in pytorch
-            - Is not needed for PyG's InMemoryDataset
-        """
-        if self.test:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_test_{idx}.pt'))
-        elif self.val:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_val_{idx}.pt'))
-        else:
-            data = torch.load(os.path.join(
-                self.processed_dir, f'data_{idx}.pt'))
-        return data
+        if self.normalize:
+            sample = self.normalize(sample)
+        return sample
 
 
-"""
-for G,R,P,D in generator('./data/raw/gnnet-ch21-dataset-train'):
-    G = nx.DiGraph(G)
-    print(P[24][1]['qosQueuesStats'][0]['avgPortOccupancy']*32/G.edges[24,1]['bandwidth']+P[0][24]['qosQueuesStats'][0]['avgPortOccupancy']*32/G.edges[0, 24]['bandwidth'])
-    print(R[0][1]) # 0,24,1
-    print(D[0, 1]['Flows'][0]['AvgDelay'])
-    break
-"""
-"""
-for features, index in generator('./data/GNN-CH21/raw/gnnet-ch21-dataset-train', dataset="GNNCH21"):
-    print(features)
-    # print(networkx_to_data(x))
-    # for node in x.nodes(data=True):
-        # if node[0].split('_')[0]=="l":
-        # print(node)
-    #    pass
-
-    # print(x)
-    break
-"""
-
-if __name__ == '__main__':
-    train_dataset = GNNC21Dataset(
-        root='data/GNNCH21/', filename='gnnet-ch21-dataset-train')
-    val_dataset = GNNC21Dataset(
-        root='data/GNNCH21/', filename='gnnet-ch21-dataset-validation', val=True)
-    test_dataset = GNNC21Dataset(
-        root='data/GNNCH21/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
+def preprocess_dataset():
     """
-    train_dataset = GNNC20Dataset(
-        root='data/GNNCH20/', filename='gnnet_data_set_training')
-    val_dataset = GNNC20Dataset(
-        root='data/GNNCH20/', filename='gnnet_data_set_validation', val=True)
-    test_dataset = GNNC20Dataset(
-        root='data/GNNCH20/', filename='gnnet_data_set_evaluation_delays', test=True)
+    Pass through the dataset to preprocess the dataset and save the processed objects
     """
+    train_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['train'], convert_files=True)
+    val_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=True)
+    test_dataset = GNN21Dataset(root_dir=CONVERTED_DIRS['test'], convert_files=True)
+
+    train_loader = torch_geometric.loader.DataLoader(train_dataset, batch_size=BATCH_SIZE['train'], shuffle=False)
+    val_loader = torch_geometric.loader.DataLoader(val_dataset, batch_size=BATCH_SIZE['val'], shuffle=False)
+    test_loader = torch_geometric.loader.DataLoader(test_dataset, batch_size=BATCH_SIZE['val'], shuffle=False)
+    i = 0
+
+    for _ in tqdm(train_loader):
+        pass
+
+    for _ in tqdm(val_loader):
+        pass
+
+    for _ in tqdm(test_loader):
+        pass
+
+
+def match_file(f):
+    g = re.match("(validation|train|test)\_(\d+)\_(\d+).*", f).groups()
+    g = [g[0], int(g[1]), int(g[2])]
+    return g
+
+
+def seperate_validation_dataset(filenames, path_to_original_dataset):
+
+    matches = [match_file(f) for f in filenames]
+    reader = datanetAPI.DatanetAPI(path_to_original_dataset)
+    files_num = np.array([m[1] for m in matches], dtype=np.int32)
+    samples_num = np.array([m[2] for m in matches], dtype=np.int32)
+
+    all_paths = np.array(reader.get_available_files())
+
+    df = pd.DataFrame(index=filenames, columns=['full_path', 'num_nodes', 'validation_setting'])
+    df['full_path'] = all_paths[files_num, 0]
+    df['sample_num'] = samples_num
+    df['file_num'] = files_num
+
+    df['num_nodes'] = np.array([osp.split(f)[-1] for f in df['full_path'].values], dtype=np.int32)
+
+    if matches[0][0] in ['validation', 'test']:
+        df['validation_setting'] = np.array([osp.split(f)[-2][-1] for f in df['full_path'].values], dtype=np.int32)
+    else:
+        df['validation_setting'] = -1
+
+    df = df.sort_values(by=['validation_setting', 'num_nodes', 'file_num', 'sample_num'])
+    return df
+
+
+def initDataset(config):
+    ds_val = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False)
+
+    df_val = seperate_validation_dataset(ds_val.filenames, RAW_DIRS['validation'])
+
+    df_val['filenames'] = df_val.index.values
+
+    datasets = {"train": GNN21Dataset(root_dir=CONVERTED_DIRS['train'], convert_files=False, normalize=config["NORMALIZE_DATASET"]),
+                "val": GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False, normalize=config["NORMALIZE_DATASET"]),
+                "test": GNN21Dataset(root_dir=CONVERTED_DIRS['test'], convert_files=False, normalize=config["NORMALIZE_DATASET"])}
+    for i in range(3):
+        which_files = list(df_val[df_val['validation_setting'] == i + 1]['filenames'].values)
+        ds = GNN21Dataset(root_dir=CONVERTED_DIRS['validation'], convert_files=False, filenames=which_files)
+        datasets[f'val_{i+1}'] = ds
+
+    dataloaders = {}
+    for k in datasets.keys():
+        if k.startswith('train'):
+            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=BATCH_SIZE['train'], shuffle=True)
+        else:
+            dataloaders[k] = torch_geometric.loader.DataLoader(datasets[k], batch_size=BATCH_SIZE['val'], shuffle=False)
+
+    return datasets, dataloaders
+
+
+def get_statistics():
+    datasets, _ = initDataset()
+    for k in datasets.keys():
+
+        labels = pd.Series([], dtype="float64")
+        link_load = pd.Series([], dtype="float64")
+        link_load_2 = pd.Series([], dtype="float64")
+        link_load_3 = pd.Series([], dtype="float64")
+        link_capacity = pd.Series([], dtype="float64")
+        link_baseline_1 = pd.Series([], dtype="float64")
+        link_baseline_2 = pd.Series([], dtype="float64")
+        link_baseline_3 = pd.Series([], dtype="float64")
+
+        AvgPktsLambda = pd.Series([], dtype="float64")
+        PktsGen = pd.Series([], dtype="float64")
+        AvgBw = pd.Series([], dtype="float64")
+        _AvgPktsLambda = pd.Series([], dtype="float64")
+        _PktsGen = pd.Series([], dtype="float64")
+        _AvgBw = pd.Series([], dtype="float64")
+        path_baseline = pd.Series([], dtype="float64")
+        
+        for sample in tqdm(datasets[k]):
+            s1 = pd.Series(sample['path'].y)
+            labels = labels.append(s1, ignore_index=True)
+            
+            s1 = pd.Series(sample['link'].x[:, 0])
+            link_load = link_load.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['link'].x[:, 1])
+            link_load_2 = link_load_2.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['link'].x[:, 2])
+            link_load_3 = link_load_3.append(s1, ignore_index=True)
+            """
+            s1 = pd.Series(sample['link'].x[:, 3])
+            link_capacity = link_capacity.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['link'].x[:, 4])
+            link_baseline_1 = link_baseline_1.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['link'].x[:, 5])
+            link_baseline_2 = link_baseline_2.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['link'].x[:, 6])
+            link_baseline_3 = link_baseline_3.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 0])
+            AvgPktsLambda = AvgPktsLambda.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 1])
+            PktsGen = PktsGen.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 2])
+            AvgBw = AvgBw.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 3])
+            _AvgPktsLambda = _AvgPktsLambda.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 4])
+            _PktsGen = _PktsGen.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 5])
+            _AvgBw = _AvgBw.append(s1, ignore_index=True)
+
+            s1 = pd.Series(sample['path'].x[:, 6])
+            path_baseline = path_baseline.append(s1, ignore_index=True)
+            """
+
+
+
+        labels.to_csv(f'{k}_labels.csv', header=None)
+        
+        link_load.to_csv(f'{k}_link_load.csv', header=None)
+        link_load_2.to_csv(f'{k}_link_load_2.csv', header=None)
+        link_load_3.to_csv(f'{k}_link_load_3.csv', header=None)
+        """
+        link_capacity.to_csv(f'{k}_link_capacity.csv', header=None)
+        link_baseline_1.to_csv(f'{k}_link_baseline_1.csv', header=None)
+        link_baseline_2.to_csv(f'{k}_link_baseline_2.csv', header=None)
+        link_baseline_3.to_csv(f'{k}_link_baseline_3.csv', header=None)
+        AvgPktsLambda.to_csv(f'{k}_AvgPktsLambda.csv', header=None)
+        PktsGen.to_csv(f'{k}_PktsGen.csv', header=None)
+        AvgBw.to_csv(f'{k}_AvgBw.csv', header=None)
+        _AvgPktsLambda.to_csv(f'{k}__AvgPktsLambda_.csv', header=None)
+        _PktsGen.to_csv(f'{k}__PktsGen_.csv', header=None)
+        _AvgBw.to_csv(f'{k}__AvgBw_.csv', header=None)
+        path_baseline.to_csv(f'{k}_path_baseline.csv', header=None)
+        """
+
+
+class Welford(object):
+    """ Welford's algorithm for computing a running mean, std, and standard error
+    """
+
+    def __init__(self, lst=None):
+        self.k = 0
+        self.M = 0
+        self.S = 0
+        self.max = 0
+        self.min = np.inf
+
+        self.__call__(lst)
+
+    def update(self, x):
+        if x is None or isinstance(x, np.str_):
+            return
+        self.k += 1
+        newM = self.M + (x - self.M) * 1. / self.k
+        newS = self.S + (x - self.M) * (x - newM)
+        self.M, self.S = newM, newS
+
+        if x > self.max:
+            self.max = x
+        if x < self.min:
+            self.min = x
+
+    def consume(self, lst):
+        lst = iter(lst)
+        for x in lst:
+            self.update(x)
+
+    def __call__(self, x):
+        if hasattr(x, "__iter__"):
+            self.consume(x)
+        else:
+            self.update(x)
+
+    def to_csv(self,filename):
+
+        # open the file in the write mode
+        with open(filename, 'w') as f:
+            # create the csv writer
+            writer = csv.writer(f)
+
+            # write the header
+            writer.writerow(['Max', 'Min', 'Mean', 'STD'])
+
+            # write the data
+            writer.writerow([self.maximum, self.minimum, self.mean, self.std])
+
+        pass
+
+    @property
+    def mean(self):
+        return self.M
+
+    @property
+    def standard_error(self):
+        if self.k == 0:
+            return 0
+        return self.std / math.sqrt(self.k)
+
+    @property
+    def maximum(self):
+        return self.max
+
+    @property
+    def minimum(self):
+        return self.min
+
+    @property
+    def std(self):
+        if self.k == 1:
+            return 0
+        return math.sqrt(self.S / (self.k - 1))
+
+    def __repr__(self):
+        return "<Welford: {} +- {}>".format(self.mean, self.std)
+
+
+
+def get_statistics2():
+    datasets, _ = initDataset()
+    for k in datasets.keys():
+
+        
+        #labels = Welford()
+        #link_load = Welford()
+        #link_load_2 = Welford()
+        #link_load_3 = Welford()
+        """
+        link_capacity = Welford()
+        
+        """
+        link_baseline_1 = Welford()
+        link_baseline_2 = Welford()
+        link_baseline_3 = Welford()
+        
+        AvgPktsLambda = Welford()
+        PktsGen = Welford()
+        AvgBw = Welford()
+        """
+        _AvgPktsLambda = Welford()
+        _PktsGen = Welford()
+        _AvgBw = Welford()
+        """
+        path_baseline = Welford()
+        for sample in tqdm(datasets[k]):
+            #labels(sample['path'].y)
+            
+            #link_load(sample['link'].x[:, 0])
+
+            #link_load_2(sample['link'].x[:, 1])
+
+            #link_load_3(sample['link'].x[:, 2])
+            """
+            link_capacity(sample['link'].x[:, 3])
+            
+            """
+            link_baseline_1(sample['link'].x[:, 4])
+
+            link_baseline_2(sample['link'].x[:, 5])
+
+            link_baseline_3(sample['link'].x[:, 6])
+
+            AvgPktsLambda(sample['path'].x[:, 0])
+            PktsGen(sample['path'].x[:, 1])
+            AvgBw(sample['path'].x[:, 2])
+            """
+            
+
+            _AvgPktsLambda(sample['path'].x[:, 3])
+
+            _PktsGen(sample['path'].x[:, 4])
+
+            _AvgBw(sample['path'].x[:, 5])
+
+            
+            """
+            path_baseline(sample['path'].x[:, 6])
+
+
+
+        #labels.to_csv(f'{k}_labels.csv')
+        
+        #link_load.to_csv(f'{k}_link_load.csv')
+        #link_load_2.to_csv(f'{k}_link_load_2.csv')
+        #link_load_3.to_csv(f'{k}_link_load_3.csv')
+        """
+        link_capacity.to_csv(f'{k}_link_capacity.csv')
+        """
+        link_baseline_1.to_csv(f'{k}_link_baseline_1.csv')
+        link_baseline_2.to_csv(f'{k}_link_baseline_2.csv')
+        link_baseline_3.to_csv(f'{k}_link_baseline_3.csv')
+        AvgPktsLambda.to_csv(f'{k}_AvgPktsLambda.csv')
+        PktsGen.to_csv(f'{k}_PktsGen.csv')
+        AvgBw.to_csv(f'{k}_AvgBw.csv')
+        """
+        _AvgPktsLambda.to_csv(f'{k}__AvgPktsLambda_.csv')
+        _PktsGen.to_csv(f'{k}__PktsGen_.csv')
+        _AvgBw.to_csv(f'{k}__AvgBw_.csv')
+        """
+        path_baseline.to_csv(f'{k}_path_baseline.csv')
+
+
+if __name__ == "__main__":
+    # Preprocess the dataset
+    # preprocess_dataset()
+
+    # Get Statistics
+    get_statistics()
