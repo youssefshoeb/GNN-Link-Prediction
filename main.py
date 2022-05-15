@@ -35,20 +35,20 @@ if __name__ == "__main__":
         json_config = json.load(data_file)
 
     # Download & extract dataset
-    # download_dataset()
-    # extract_tarfiles()
+    download_dataset()
+    extract_tarfiles()
 
     # Generate torch files
-    # generate_files()
+    generate_files()
 
     # Preprocess the dataset
-    # preprocess_dataset()
+    preprocess_dataset()
 
     
     set_random_seed(json_config['SEED'])
 
     # Test Baseline
-    # test_baseline(json_config)
+    test_baseline(json_config)
 
     # Train
     train(json_config)  # Remember to change project name in config

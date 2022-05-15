@@ -3,9 +3,10 @@ Link Prediction In The Context of Dynamic Networks Masters Thesis
 
 ## Contents
 - datanetAPI.py: API to read and process samples from the dataset.
-- dataset.py: Convert samples to .pt objects.
-- download.py: Download and extract dataset.
-- preprocess.py: Preprocess the dataset and save statistics.
+- dataset.py: Dataset class for loading .pt objects.
+- downloadDataset.py: Download and extract dataset.
+- generateFiles.py: Convert dataset samples to .pt objects.
 - model.py: Heterogenous Graph Isomorphism Network model.
+- main.py: Main project file.
 - train.py: Training loop. 
-- config.py: Configuration file.
+- config.json: Configuration file.
