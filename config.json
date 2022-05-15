@@ -1,0 +1,35 @@
+{
+    "SEED":1997,
+
+    "LOSS":"mape",
+    "OPTIMIZER":"adam",
+    "LEARNING_RATE":0.001,
+    "WEIGHT_DECAY":0,
+
+    "NODE_EMBEDDING_SIZE":8,
+    "MP_LAYERS":1,
+    "DROPOUT":0.0,
+
+
+    "EPOCHS":10,
+    "TRAIN_BATCH_SIZE":8,
+    "VAL_BATCH_SIZE":1,
+    "NORMALIZE_DATASET":false,
+    "BL_FEATURES":false,
+    "DIVIDED_FEATURES":false,
+    
+    "MODEL": "GIN",
+    "HEADS":16,
+
+    "CONCAT_PATH": true,
+    "GLOBAL_FEATS":false,
+    "MLP_LAYERS":[128,32],
+    "MLP_ACT":"torch.nn.PReLU()",
+    "MLP_BN":false,
+    "MLP_HEAD_ACT":null, 
+
+
+    "PROJECT_NAME":"Thesis-Experiment-1-CV"
+
+    
+}

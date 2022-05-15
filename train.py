@@ -1,224 +1,348 @@
 import torch
+import wandb
+import os
 import torch_geometric
+from tqdm import tqdm
+from dataset import initDataset
 import numpy as np
-import mlflow
-import tqdm
-import random
-
-from dataset import HETROGNNC21Dataset
-from model import HetroGIN
-from torch_geometric.loader import DataLoader
-from config import *
+from models import HetroGAT,HetroGIN
 
 
-# Ensure deterministic behavior by setting random seed
-torch.backends.cudnn.deterministic = True
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+
+def mape(preds, actuals):
+    return 100.0 * torch.mean(torch.abs((preds - actuals) / actuals))
 
 
-def flatten(list):
-    return [item for sublist in list for item in sublist]
+def train_one_epoch(epoch, loss_func, opt, dataloader, model, k=None):
+    running_loss = 0.0
+    step = 0
 
+    running_loss_mape = 0.0
+    step_mape = 0
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-@torch.no_grad()
-def init_params(model, train_loader):
-    # Initialize lazy parameters via forwarding a single batch to the model:
-    batch = next(iter(train_loader))
-    batch = batch.to(DEVICE)
-    model(batch.x_dict, batch.edge_index_dict)
-
-
-def mape(y_predict, y_true):
-    '''
-    Mean Absolute Percentage Error
-    '''
-    # double check why one of the labels is zero ?
-    # return np.average(np.abs((y_predict - y_true) / (np.abs(y_true) + 0.0000001))) * 100
-    return torch.mean(torch.abs((y_predict - y_true) / (torch.abs(y_true) + 0.0000001))) * 100
-
-
-def calculate_metrics(y_pred, y_true, epoch, type):
-    acc = mape(y_pred, y_true)
-    print(f"MAPE-{type}: {acc}")
-    mlflow.log_metric(key=f"MAPE-{type}", value=float(acc), step=epoch)
-
-
-def train_one_epoch(epoch, model, train_loader, optimizer, loss_fn):
     # Enumerate over the data
+    total = len(dataloader)
+    for sample in tqdm(dataloader, total=total):
+        # Train model
+        with torch.set_grad_enabled(True):
+            sample.cuda()
+
+            # Reset Gradients
+            opt.zero_grad()
+
+            # Get Model Output
+            out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
+            # print(out.shape)
+
+            # Calculate loss and gradients
+            label = sample['path'].y.reshape(-1, 1)
+            # print(label.shape)
+            loss_value = loss_func(out, label)
+
+            loss = torch.sqrt(loss_value)
+            loss.backward()
+            opt.step()
+
+            # Update Tracking
+            running_loss += loss_value
+            step += 1
+
+            running_loss_mape += mape(out, label).item() * sample["path"].x.shape[0]  # TODO Double check this
+            step_mape += sample["path"].x.shape[0]
+
+    average_loss = running_loss / step
+    mape_loss = running_loss_mape / step_mape
+
+    print(f"Epoch {epoch+1} | Train Loss {average_loss}")
+    print(f"MAPE-Train: {mape_loss}")
+    if k is not None:
+        wandb.log({f"MAPE-Train - {k}": float(mape_loss), "Epoch": epoch + 1})
+        wandb.log({f"Train loss - {k}": float(average_loss), "Epoch": epoch + 1})
+    else:
+        wandb.log({f"MAPE-Train": float(mape_loss), "Epoch": epoch + 1})
+        wandb.log({"Train loss": float(average_loss), "Epoch": epoch + 1})
+
+    torch.cuda.empty_cache()
+
+    return
+
+
+def test(epoch, loss_func, dataloader, model, mode, k=None):
     all_preds = []
     all_labels = []
-    mapes = []
+
     running_loss = 0.0
     step = 0
 
-    for _, batch in tqdm.tqdm(enumerate(train_loader)):
-        # Use GPU if available
-        batch.to(DEVICE)
+    running_loss_mape = 0.0
+    step_mape = 0
 
-        # Reset gradients
-        optimizer.zero_grad()
+    with torch.no_grad():
+        # Enumerate over the data
+        for sample in tqdm(dataloader):
+            sample.cuda()
+            with torch.set_grad_enabled(False):
+                out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
 
-        # Passing the node features and the connection info
-        pred = model(batch.x_dict, batch.edge_index_dict)
+                # Get label
+                label = sample['path'].y.reshape(-1, 1)
+                loss_value = loss_func(out, label)
 
-        # Calculating the loss and gradients
-        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float).to(DEVICE)
-        loss_value = loss_fn(torch.squeeze(pred), label)
-        """
-        Root mean squared error (should we square the error first )?
-        However squaring the error will give more weight to larger errors than smaller ones,
-        skewing the error estimate towards the odd outliers, Do we want this ?
-        Currently I'm keeping the mean absolute error however I am taking the square root of
-        the value does this make sense ? or should I remove the square root ?
-        """
-        loss = torch.sqrt(loss_value)
-        loss.backward()
-        optimizer.step()
+                # Update Tracking
+                running_loss += loss_value.item()
+                step += 1
 
-        # Update tracking
-        running_loss += loss_value.item()
-        step += 1
-        # all_preds.append(pred.cpu().detach().numpy())
-        # all_labels.append(label.cpu().detach().numpy())
-        mapes.append(loss_value.cpu().detach().numpy())
-        # break # TODO
+                running_loss_mape += mape(out, label).item() * sample["path"].x.shape[0]
+                step_mape += sample["path"].x.shape[0]
+                all_preds.append(out.cpu().detach().numpy())
+                all_labels.append(label.cpu().detach().numpy())
 
-    # all_preds = np.concatenate(all_preds).ravel()
-    # all_labels = np.concatenate(all_labels).ravel()
-    # calculate_metrics(all_preds, all_labels, epoch, "train")
-    print(f"MAPE-train: {np.average(mapes)}")
-    mlflow.log_metric(key=f"MAPE-train", value=float(np.average(mapes)), step=epoch)
-    return running_loss / step
+        average_loss = running_loss / step
+        mape_loss = running_loss_mape / step_mape
 
+        print(f"Epoch {epoch+1} | {mode} Loss {average_loss}")
+        print(f"MAPE-{mode}: {mape_loss}")
 
-def test(epoch, model, test_loader, loss_fn, mode):
-    all_preds = []
-    all_labels = []
-    mapes = []
-    running_loss = 0.0
-    step = 0
-    for batch in tqdm.tqdm(test_loader):
-        batch.to(DEVICE)
-        pred = model(batch.x_dict, batch.edge_index_dict)
-        label = torch.tensor(np.array(flatten(batch['path'].y)), dtype=torch.float).to(DEVICE)
-        loss = loss_fn(torch.squeeze(pred), label)
+        if k is not None:
+            wandb.log({f"MAPE-{mode}-{k}": float(mape_loss), "Epoch": epoch + 1})
+            wandb.log({f"Validation loss-{k}": float(average_loss), "Epoch": epoch + 1})
+        else:
+            wandb.log({f"MAPE-{mode}": float(mape_loss), "Epoch": epoch + 1})
+            wandb.log({f"{mode} loss": float(average_loss), "Epoch": epoch + 1})
 
-        # Update tracking
-        running_loss += loss.item()
-        step += 1
-        mapes.append(loss.cpu().detach().numpy())
-        # all_preds.append(pred.cpu().detach().numpy())
-        # all_labels.append(label.cpu().detach().numpy())
-        # break # TODO
-
-    # all_preds = np.concatenate(all_preds).ravel()
-    # all_labels = np.concatenate(all_labels).ravel()
-    # calculate_metrics(all_preds, all_labels, epoch, mode)
-    print(f"MAPE-{mode}: {np.average(mapes)}")
-    mlflow.log_metric(key=f"MAPE-{mode}", value=float(np.average(mapes)), step=epoch)
-    return running_loss / step
+        return average_loss
 
 
-if __name__ == "__main__":
+def load_model(config, datasets):
+    input_channels = {'link': datasets["train"][0]['link']['x'].shape[1],
+                      'path': datasets["train"][0]['path']['x'].shape[1],
+                      'node': datasets["train"][0]['node']['x'].shape[1]}
+    if config['MODEL'] == "GAT":
+        model = HetroGAT(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
+                         message_passing_layers=config['MP_LAYERS'], dropout=config['DROPOUT'], heads=config['HEADS'],
+                         concat_path=config['CONCAT_PATH'],bl_features=config["BL_FEATURES"], divided_features=config["DIVIDED_FEATURES"],
+                         global_feats=config['GLOBAL_FEATS'], mlp_layers=config['MLP_LAYERS'],
+                         act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
 
+    elif config['MODEL'] == "GIN":
+        model = HetroGIN(input_channels=input_channels, node_embedding_size=config['NODE_EMBEDDING_SIZE'],
+                         message_passing_layers=config['MP_LAYERS'], dropout=config['DROPOUT'], concat_path=config['CONCAT_PATH'],
+                         bl_features=config["BL_FEATURES"],divided_features=config["DIVIDED_FEATURES"],
+                         global_feats=config['GLOBAL_FEATS'], mlp_layers=config['MLP_LAYERS'],
+                         act=config['MLP_ACT'], mlp_bn=config['MLP_BN'], mlp_head_act=config['MLP_HEAD_ACT'])
+
+    else:
+        raise IOError("Model not implemented")
+
+    return model
+
+
+def load_optmizer(config, model):
+    if config['OPTIMIZER'] == 'adam':
+        return torch.optim.Adam(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+    if config['OPTIMIZER'] == 'adamW':
+        return torch.optim.AdamW(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+    if config['OPTIMIZER'] == 'sgd':
+        return torch.optim.SGD(lr=config["LEARNING_RATE"], params=model.parameters(), weight_decay=config['WEIGHT_DECAY'])
+
+
+def save_best_model(model, run):
+    os.makedirs("./runs", exist_ok=True)
+
+    print("Saving new best model ...")
+    model = model.to("cpu")
+
+    if not os.path.exists(f'runs/{run.name}'):
+        os.mkdir(f'runs/{run.name}')
+    torch.save(model.state_dict(), f'runs/{run.name}/best_model.pth')
+    model = model.cuda()
+
+
+def train(config):
     print(f"Torch version: {torch.__version__}")
     print(f"Cuda available: {torch.cuda.is_available()}")
     print(f"Torch geometric version: {torch_geometric.__version__}")
 
-    # Specify tracking server
-    mlflow.set_experiment(experiment_name="GNNs")
+    with wandb.init(project=config['PROJECT_NAME'], entity="youssefshoeb", config=config) as run:
+        # Access all hyperparameters through wandb.config, so logging matches execution
+        config = wandb.config
 
-    # Loading the dataset
-    print("Loading dataset...")
-    train_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-train')
-    val_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-validation', val=True)
-    test_dataset = HETROGNNC21Dataset(root='data/GNN-CH21-H/', filename='gnnet-ch21-dataset-test-with-labels', test=True)
-    data = train_dataset[0]
+        print("Loading Dataset...")
+        datasets, dataloaders = initDataset(config)
 
-    # Prepare training
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=VAL_BATCH_SIZE, shuffle=True)
+        print("Loading model...")
+        model = load_model(config, datasets)
+        model.cuda()
 
-    # Loading the model
-    print("Loading model...")
-    # Define a homogeneous GNN model
-    input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1], 'node': data['node']['x'].shape[1]}
-    # input_channels = {'link': data['link']['x'].shape[1], 'path': data['path']['x'].shape[1]}
-    # model = HetroLineGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
-    #                 act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
-    model = HetroGIN(input_channels=input_channels, embedding_size=EMBEDDING_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT,
-                     act=ACT, norm=BN, jk=JK_MODE, post_hidden_layer_size=MLP_EMBEDDING, post_num_layers=MLP_LAYERS)
-    # Convert a homogeneous GNN model into its heterogeneous equivalent
-    model = model.to(DEVICE)
+        # Hyperparameters
+        num_epochs = config["EPOCHS"]
+        loss_func = eval(config["LOSS"])
 
-    # Initialize parameters.
-    # init_params(model, train_loader) # not needed since we are not using lazy initialization
-    num_params = count_parameters(model)
-    print(f"Number of parameters: {num_params}")
-
-    with mlflow.start_run(run_name="GIN Run: 4"):
-        mlflow.log_param("num_params", num_params)
-        mlflow.log_param("embedding_size", EMBEDDING_SIZE)
-        mlflow.log_param("num_mp_layers", NUM_LAYERS)
-        mlflow.log_param("mlp_embedding_size", MLP_EMBEDDING)
-        mlflow.log_param("mlp_layers", MLP_LAYERS)
-        mlflow.log_param("dropout", DROPOUT)
-        mlflow.log_param("act", str(ACT))
-        mlflow.log_param("bn", str(BN))
-        mlflow.log_param("jk", JK_MODE)
-
-        # Training paramerers
-        loss_fn = mape  # torch.nn.MSELoss()
-        # optimizer = torch.optim.Adam(list(model.parameters()) + list(model_readout.parameters()), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=DECAY_RATE)
-        optimizer = torch.optim.Adam(list(model.parameters()), lr=LEARNING_RATE)
-        # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=DECAY_RATE)
-        mlflow.log_param("learning_rate", LEARNING_RATE)
-        mlflow.log_param("decay_rate", DECAY_RATE)
-        mlflow.log_param("weight_decay", WEIGHT_DECAY)
-        mlflow.log_param("epochs", EPOCHS)
-
-        best_loss = np.inf
+        opt = load_optmizer(config, model)
 
         # Start training
-        for epoch in range(EPOCHS):
-            # Training
+        best_loss = np.inf
+        for epoch in range(num_epochs):
             model.train()
-            loss = train_one_epoch(epoch, model, train_loader, optimizer, loss_fn)
-            print(f"Epoch {epoch+1} | Train Loss {loss}")
-            mlflow.log_metric(key="Train loss", value=float(loss), step=epoch)
+            # Train
+            train_one_epoch(epoch, loss_func, opt, dataloaders['train'], model)
+
+            model.eval()
+            # Evaluation on validation set 1
+            test(epoch, loss_func, dataloaders['val_1'], model, "Validation_1")
+
+            # Evaluation on validation set 2
+            test(epoch, loss_func, dataloaders['val_2'], model, "Validation_2")
+
+            # Evaluation on validation set 3
+            test(epoch, loss_func, dataloaders['val_3'], model, "Validation_3")
 
             # Evaluation on validation set
-            model.eval()
-            loss = test(epoch, model, val_loader, loss_fn, "validation")
-            print(f"Epoch {epoch+1} | Validation Loss {loss}")
-            mlflow.log_metric(key="Validation loss", value=float(loss), step=epoch)
+            loss = test(epoch, loss_func, dataloaders['val'], model, "Validation")
 
             # Update best loss
             if loss < best_loss:
                 best_loss = loss
-                #  Save the current best model
-                print("Saving new best model ...")
-                model = model.to("cpu")
-                mlflow.pytorch.log_model(model, "best_model")
-                model = model.to(DEVICE)
+                save_best_model(model, run)
 
-            # scheduler.step()
+        # evaluate best model
+        evaluate(config, run.name)
 
-        # Save the final model
-        mlflow.pytorch.log_model(model, f"{EPOCHS}_model")
 
-        # Test best model
-        model_uri = "runs:/{}/best_model".format(mlflow.active_run().info.run_id)
-        best_model = mlflow.pytorch.load_model(model_uri)
-        best_model = best_model.to(DEVICE)
-        loss = test(0, best_model, test_loader, loss_fn, "test")
-        print(f"Test Loss {loss}")
+
+def test_baseline(config):
+    _, dataloaders = initDataset(config)
+
+    # Train
+    all_preds = []
+    all_labels = []
+
+    for sample in tqdm(dataloaders['val'], total=len(dataloaders['val'])):
+        with torch.set_grad_enabled(False):
+            b_out = sample['path'].x[:, 3]
+
+            all_preds.append(torch.squeeze(b_out).cpu().detach().numpy())
+            all_labels.append(sample['path'].y.cpu().detach().numpy())
+
+    all_preds = torch.from_numpy(np.concatenate(all_preds).ravel())
+    all_labels = torch.from_numpy(np.concatenate(all_labels).ravel())
+
+    loss = mape(all_preds, all_labels)
+    print('Test', loss)
+
+    torch.cuda.empty_cache()
+
+    """
+    Training tensor(10.5695)
+    Val tensor(10.0665)
+    Val_1 tensor(11.2141)
+    Val_2 tensor(10.7487)
+    Val_3 tensor(9.3497)
+    Test tensor(9.3962)
+    """
+
+
+def cross_validate(config):
+    K_FOLD = 10
+    with wandb.init(project=config['PROJECT_NAME'], entity="youssefshoeb", config=config):
+        # Access all hyperparameters through wandb.config, so logging matches execution
+        config = wandb.config
+
+        print("Loading Dataset...")
+        datasets, _ = initDataset(config)
+
+        # Hyperparameters
+        num_epochs = config["EPOCHS"]
+        loss_func = eval(config["LOSS"])
+
+        # k-fold cross validation scores and segment size
+        val_score = []
+
+        total_size = len(datasets['train'])
+        fraction = 1 / K_FOLD
+        seg = int(total_size * fraction)
+
+        for i in range(K_FOLD):
+            print(f"...Fold... {i + 1}")
+            print("Loading model...")
+            model = load_model(config, datasets)
+            model.cuda()
+
+            opt = load_optmizer(config, model)
+
+            # Dataset split
+            trll = 0
+            trlr = i * seg
+            vall = trlr
+            valr = i * seg + seg
+            trrl = valr
+            trrr = total_size
+
+            train_left_indices = list(range(trll, trlr))
+            train_right_indices = list(range(trrl, trrr))
+
+            train_indices = train_left_indices + train_right_indices
+            val_indices = list(range(vall, valr))
+
+            train_set = torch.utils.data.dataset.Subset(datasets['train'], train_indices)
+            val_set = torch.utils.data.dataset.Subset(datasets['train'], val_indices)
+
+            # Prepare training
+            train_loader = torch_geometric.loader.DataLoader(train_set, batch_size=config['TRAIN_BATCH_SIZE'], shuffle=True)
+            val_loader = torch_geometric.loader.DataLoader(val_set, batch_size=config['TRAIN_BATCH_SIZE'], shuffle=True)
+
+            # Start training
+            best_loss = np.inf
+            for epoch in range(num_epochs):
+                # Training
+                model.train()
+                train_one_epoch(epoch, loss_func, opt, train_loader, model, k=i + 1)
+
+                # Evaluation on validation set
+                model.eval()
+                loss = test(epoch, loss_func, val_loader, model, "Validation_1", k=i + 1)
+
+                # Update best loss
+                if loss < best_loss:
+                    best_loss = loss
+
+            # Record the best validation error
+            wandb.log({f"Best MAPE-validation": best_loss, "Fold": i + 1})
+            val_score.append(best_loss)
+            # free cache
+            torch.cuda.empty_cache()
+            del model
+
+        # Record the best validation error
+        wandb.log({f"Average Best MAPE-validation": float(np.mean(val_score)), "Epoch": 0})
+        print("Mean Val Loss", np.mean(val_score))
+
+def evaluate(config, filename):
+    datasets, dataloaders = initDataset(config)
+
+    model = load_model(config, datasets)
+
+    model.load_state_dict(torch.load(f'./runs/{filename}/best_model.pth'))
+
+    model.eval()
+    running_loss = 0.0
+    step = 0
+
+    for _, sample in tqdm(enumerate(dataloaders['test']), total=len(dataloaders['test'])):
+        with torch.set_grad_enabled(False):
+            out = model(sample.x_dict, sample.edge_index_dict, sample["path"].batch)
+
+            # Get label
+            label = sample['path'].y.reshape(-1, 1)
+            loss_value = mape(out, label)
+
+            # Update Tracking
+            running_loss += loss_value.item()
+            step += 1
+
+    average_loss = running_loss / step
+
+    print('Test', average_loss)
+    wandb.log({f"Test loss": float(average_loss), "Epoch": 0})
